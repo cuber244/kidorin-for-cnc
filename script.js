@@ -287,6 +287,8 @@ function openHelpWindow(){
     <li>「<strong>ジョイント＆Tボーン一括生成</strong>」で両方をまとめて処理できます。</li>
     <li>「<strong>ミル径</strong>」は使用するエンドミルの直径（6mm または 12mm）を選んでください。Tボーンの径とタブサイズに影響します。</li>
     <li>「<strong>クリアランス</strong>」はジョイントのはめ合い隙間（mm）です。材料の厚みや加工精度に応じて調整してください（初期値 0.2mm）。</li>
+    <li>3D表示の「<strong>交差部編集</strong>」を押すと、交差部のハイライトと一覧が表示されます。編集中に交差部をクリックすると、その交差だけ奇数・偶数の切削担当を反転し、元のSTL形状から再計算します。</li>
+    <li>交差部編集モード中は「<strong>表示：不透過／表示：透過</strong>」で部材のマテリアルを切り替えられます。編集終了時は通常の不透過表示へ戻ります。</li>
     <li>「<strong>STL初期状態に戻す</strong>」でジョイント・Tボーン等の変更をすべてリセットできます。</li>
   </ul>
 
@@ -325,7 +327,43 @@ function openHelpWindow(){
       }
     }
 
-function open3dWindow() {
+function makeGeometryExportData(geometries) {
+  return (geometries || []).map(geo => {
+    const posRaw = geo.attributes.position.array;
+    const pos = new Array(posRaw.length);
+    for (let i=0; i<posRaw.length; i++) pos[i] = Math.round(posRaw[i]*1000)/1000;
+    let norm = null;
+    if (geo.attributes.normal) {
+      const normRaw = geo.attributes.normal.array;
+      norm = new Array(normRaw.length);
+      for (let i=0; i<normRaw.length; i++) norm[i] = Math.round(normRaw[i]*1000)/1000;
+    }
+    return {pos,norm};
+  });
+}
+
+function getJointViewerData() {
+  return jointCandidates.map(j => ({
+    id:j.id,label:j.label,partAIndex:j.partAIndex,partBIndex:j.partBIndex,
+    splitAxis:j.splitAxis,splitLength:j.splitLength,divisions:j.divisions,
+    defaultMortiseIndex:j.defaultMortiseIndex,
+    selectedMortiseIndex:jointAssignments.get(j.id) ?? j.defaultMortiseIndex,
+    center:{...j.center},size:{...j.size},min:{...j.min},max:{...j.max}
+  }));
+}
+
+function syncJointViewer() {
+  if (!jointViewerWindow || jointViewerWindow.closed) return;
+  try {
+    if (typeof jointViewerWindow.__kidorinUpdateModel === 'function') {
+      jointViewerWindow.__kidorinUpdateModel(makeGeometryExportData(geometriesCache),getJointViewerData());
+    }
+  } catch (e) {
+    console.warn('3Dビューの同期に失敗しました:',e);
+  }
+}
+
+    function open3dWindow() {
   if (!geometriesCache || geometriesCache.length === 0) {
     alert('先にSTLファイルを読み込んでください。');
     return;
@@ -336,6 +374,10 @@ function open3dWindow() {
   const w = window.open('about:blank', '3dViewer_' + Date.now(), `popup=yes,width=${winW},height=${winH},resizable=yes,scrollbars=no`);
   
   if (!w) { alert('ポップアップがブロックされました。'); return; }
+  jointViewerWindow = w;
+  if (!jointCandidates.length && originalGeometriesCache.length > 1) {
+    jointCandidates = detectJointCandidates(originalGeometriesCache);
+  }
 
   const svg = document.querySelector('#svg-container svg');
   const colorsBySvg = [];
@@ -348,20 +390,10 @@ function open3dWindow() {
   const fallbackColors = ['#dbeafe','#fde68a','#fecdd3','#d1fae5','#e9d5ff','#fed7aa','#bfdbfe','#fbcfe8','#fde2e4','#ddd6fe','#c7f9cc','#faedcd'];
   const colors = Array.from({length: geometriesCache.length}, (_, i) => colorsBySvg[i] || fallbackColors[i % fallbackColors.length]);
 
-  const exportData = geometriesCache.map(geo => {
-      const posRaw = geo.attributes.position.array;
-      const pos = new Array(posRaw.length);
-      for(let i=0; i<posRaw.length; i++) pos[i] = Math.round(posRaw[i]*1000)/1000;
-      let norm = null;
-      if (geo.attributes.normal) {
-          const normRaw = geo.attributes.normal.array;
-          norm = new Array(normRaw.length);
-          for(let i=0; i<normRaw.length; i++) norm[i] = Math.round(normRaw[i]*1000)/1000;
-      }
-      return { pos, norm };
-  });
+  const exportData = makeGeometryExportData(geometriesCache);
   
   const geometriesJson = JSON.stringify(exportData);
+  const jointsJson = JSON.stringify(getJointViewerData());
 
   const htmlDoc = `<!doctype html>
 <html lang="ja">
@@ -391,37 +423,60 @@ function open3dWindow() {
     #toolbar { display: none; }
   }
 
-  #close-btn, #reset-btn, #dim-btn, #stl-export-btn, #glb-export-btn {
+  #close-btn, #reset-btn, #dim-btn, #stl-export-btn, #glb-export-btn, #view-mode-btn, #joint-edit-btn {
     position:absolute;top:10px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.1);
     color:#fff;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:11px;transition:background 0.2s;
     z-index: 20;
   }
   #close-btn{right:14px;} #reset-btn{right:78px;}
-  #close-btn:hover, #reset-btn:hover, #dim-btn:hover, #stl-export-btn:hover, #glb-export-btn:hover {background:rgba(255,255,255,0.3);}
+  #close-btn:hover, #reset-btn:hover, #dim-btn:hover, #stl-export-btn:hover, #glb-export-btn:hover, #view-mode-btn:hover, #joint-edit-btn:hover {background:rgba(255,255,255,0.3);}
   #dim-btn{right:152px;} #dim-btn.active{background:rgba(255,255,255,0.35);font-weight:700;}
   #stl-export-btn{right:240px;background:rgba(40,167,69,0.5);border-color:rgba(40,167,69,0.3);}
   #glb-export-btn{right:350px;background:rgba(111,66,193,0.5);border-color:rgba(111,66,193,0.3);}
+  #joint-edit-btn{right:14px;top:44px;background:rgba(40,167,69,.62);border-color:rgba(100,220,130,.45);min-width:116px;}
+  #joint-edit-btn.active{background:rgba(220,53,69,.72);border-color:rgba(255,120,130,.6);}
+  #view-mode-btn{right:14px;top:78px;background:rgba(0,123,255,.55);border-color:rgba(80,170,255,.45);min-width:116px;display:none;}
+  #view-mode-btn.transparent-mode{background:rgba(230,126,34,.65);border-color:rgba(255,190,110,.55);}
   
   #info{
     position:absolute;bottom:12px;left:50%;transform:translateX(-50%);
     color:rgba(255,255,255,0.5);font-size:10px;pointer-events:none;font-weight:bold;
   }
+  #joint-panel{
+    position:absolute;left:14px;bottom:34px;z-index:30;width:310px;max-height:42vh;overflow:auto;
+    color:#fff;background:rgba(8,12,20,.82);border:1px solid rgba(255,255,255,.18);border-radius:8px;padding:10px;
+    font-size:11px;backdrop-filter:blur(8px);display:none;
+  }
+  #joint-panel h2{font-size:13px;margin:0 0 6px;color:#ffd166;}
+  #joint-panel .hint{color:#b9c2d0;line-height:1.45;margin-bottom:7px;}
+  .joint-row{display:flex;align-items:center;gap:7px;padding:6px;border-top:1px solid rgba(255,255,255,.1);cursor:pointer;}
+  .joint-row:hover{background:rgba(255,255,255,.09);}
+  .joint-chip{width:10px;height:10px;border-radius:50%;flex:none;box-shadow:0 0 8px currentColor;}
+  .joint-main{flex:1;min-width:0;}.joint-title{font-weight:700}.joint-meta{color:#9da9b8;font-size:10px;}
+  .joint-pattern{font-weight:700;color:#7ee787;white-space:nowrap;}
+  #joint-status{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:50;display:none;
+    color:#fff;background:rgba(0,0,0,.82);border:1px solid rgba(255,255,255,.25);padding:12px 18px;border-radius:8px;font-size:13px;}
 </style>
 </head>
 <body>
 <div id="canvas-wrap"><canvas id="c"></canvas></div>
-<div id="toolbar"><span>左ドラッグ：回転 / 右：移動 / ホイール：ズーム</span></div>
+<div id="toolbar"><span id="toolbar-text">左ドラッグ：回転　/　右：移動　/　ホイール：ズーム</span></div>
 <button id="reset-btn" onclick="resetCamera()">リセット</button>
 <button id="dim-btn" onclick="toggleDimensions()">寸法表示</button>
 <button id="stl-export-btn" onclick="exportSTL()">STLエクスポート</button>
 <button id="glb-export-btn" onclick="exportGLB()">GLBエクスポート</button>
+<button id="joint-edit-btn" onclick="toggleJointEditMode()">交差部編集</button>
+<button id="view-mode-btn" onclick="toggleMaterialViewMode()">表示：不透過</button>
 <button id="close-btn" onclick="window.close()">閉じる</button>
 <div id="info"></div>
+<div id="joint-panel"></div>
+<div id="joint-status">ジョイントを再計算しています…</div>
 
 <script src="https://unpkg.com/three@0.128.0/build/three.min.js"><\/script>
 <script>
 const COLORS = ${JSON.stringify(colors)};
-const parentGeosData = ${geometriesJson};
+let parentGeosData = ${geometriesJson};
+let parentJointData = ${jointsJson};
 
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
@@ -448,26 +503,50 @@ scene.add(dirLight);
 const group = new THREE.Group();
 let minX=Infinity, minY=Infinity, minZ=Infinity;
 let maxX=-Infinity, maxY=-Infinity, maxZ=-Infinity;
+let modelMeshes = [];
+let jointMarkerGroup = new THREE.Group();
+let clickableJointMarkers = [];
+let materialViewMode = 'opaque';
+let jointEditMode = false;
 
-if (parentGeosData && parentGeosData.length > 0) {
-    parentGeosData.forEach((data, ci) => {
+function disposeObject3D(obj){
+  if(obj.geometry) obj.geometry.dispose();
+  if(obj.material){
+    if(Array.isArray(obj.material)) obj.material.forEach(m=>m.dispose());
+    else obj.material.dispose();
+  }
+}
+
+function loadModelData(dataList, resetBounds){
+  modelMeshes.forEach(mesh=>{ group.remove(mesh); disposeObject3D(mesh); });
+  modelMeshes = [];
+  if(resetBounds){minX=Infinity;minY=Infinity;minZ=Infinity;maxX=-Infinity;maxY=-Infinity;maxZ=-Infinity;}
+  if (dataList && dataList.length > 0) dataList.forEach((data, ci) => {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(data.pos), 3));
         if(data.norm) geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(data.norm), 3));
         else geo.computeVertexNormals();
         geo.computeBoundingBox();
-        minX = Math.min(minX, geo.boundingBox.min.x); minY = Math.min(minY, geo.boundingBox.min.y); minZ = Math.min(minZ, geo.boundingBox.min.z);
-        maxX = Math.max(maxX, geo.boundingBox.max.x); maxY = Math.max(maxY, geo.boundingBox.max.y); maxZ = Math.max(maxZ, geo.boundingBox.max.z);
+        if(resetBounds){
+          minX = Math.min(minX, geo.boundingBox.min.x); minY = Math.min(minY, geo.boundingBox.min.y); minZ = Math.min(minZ, geo.boundingBox.min.z);
+          maxX = Math.max(maxX, geo.boundingBox.max.x); maxY = Math.max(maxY, geo.boundingBox.max.y); maxZ = Math.max(maxZ, geo.boundingBox.max.z);
+        }
 
         const hex = parseInt(COLORS[ci % COLORS.length].replace('#',''), 16);
         const mat = new THREE.MeshStandardMaterial({
-            color: hex, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide
+            color: hex, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide,
+            transparent: materialViewMode === 'transparent',
+            opacity: materialViewMode === 'transparent' ? 0.32 : 1.0,
+            depthWrite: materialViewMode !== 'transparent'
         });
         const mesh = new THREE.Mesh(geo, mat);
+        mesh.userData.partIndex = ci;
         mesh.castShadow = true; mesh.receiveShadow = true;
         group.add(mesh);
+        modelMeshes.push(mesh);
     });
 }
+loadModelData(parentGeosData,true);
 
 const maxDim = isFinite(maxX) ? Math.max(maxX-minX, maxY-minY, maxZ-minZ) : 100;
 const centerX = isFinite(maxX) ? (minX+maxX)/2 : 0;
@@ -477,6 +556,136 @@ const centerZ = isFinite(maxZ) ? (minZ+maxZ)/2 : 0;
 group.rotation.x = -Math.PI / 2;
 group.position.sub(new THREE.Vector3(centerX, centerZ, -centerY));
 scene.add(group);
+
+function setJointStatus(show,text){
+  const el=document.getElementById('joint-status');
+  if(!el)return;
+  if(text)el.textContent=text;
+  el.style.display=show?'block':'none';
+}
+
+function applyMaterialViewMode(){
+  const transparent=jointEditMode&&materialViewMode==='transparent';
+  modelMeshes.forEach(function(mesh){
+    const materials=Array.isArray(mesh.material)?mesh.material:[mesh.material];
+    materials.forEach(function(mat){
+      mat.transparent=transparent;
+      mat.opacity=transparent?0.32:1.0;
+      mat.depthWrite=!transparent;
+      mat.needsUpdate=true;
+    });
+  });
+  clickableJointMarkers.forEach(function(marker){
+    if(marker.material){marker.material.opacity=transparent?0.52:0.16;marker.material.needsUpdate=true;}
+  });
+  const btn=document.getElementById('view-mode-btn');
+  if(btn){
+    btn.textContent=transparent?'表示：透過':'表示：不透過';
+    btn.classList.toggle('transparent-mode',transparent);
+    btn.title=transparent?'クリックすると不透過表示に戻します':'クリックすると部材を透過表示します';
+    btn.style.display=jointEditMode?'block':'none';
+  }
+  jointMarkerGroup.visible=jointEditMode;
+  const panel=document.getElementById('joint-panel');
+  if(panel)panel.style.display=jointEditMode?'block':'none';
+  update3dViewerLabels();
+}
+
+function toggleMaterialViewMode(){
+  if(!jointEditMode)return;
+  materialViewMode=materialViewMode==='opaque'?'transparent':'opaque';
+  applyMaterialViewMode();
+}
+
+function update3dViewerLabels(){
+  const editBtn=document.getElementById('joint-edit-btn');
+  if(editBtn){
+    editBtn.textContent=jointEditMode?'交差部編集を終了':'交差部編集';
+    editBtn.classList.toggle('active',jointEditMode);
+  }
+  const toolbarText=document.getElementById('toolbar-text');
+  if(toolbarText)toolbarText.textContent=jointEditMode
+    ?'交差部クリック：奇数/偶数反転　/　透過切替可　/　左ドラッグ：回転　/　右：移動'
+    :'左ドラッグ：回転　/　右：移動　/　ホイール：ズーム';
+  const info=document.getElementById('info');
+  if(info)info.textContent=jointEditMode
+    ?'交差部編集モード　交差部: '+parentJointData.length+'　色付き領域をクリックして反転'
+    :'部品数: '+parentGeosData.length+'　サイズ: '+Math.round(maxX-minX)+' × '+Math.round(maxY-minY)+' × '+Math.round(maxZ-minZ)+' mm';
+}
+
+function toggleJointEditMode(){
+  jointEditMode=!jointEditMode;
+  if(!jointEditMode)materialViewMode='opaque';
+  applyMaterialViewMode();
+}
+
+function requestJointToggle(jointId){
+  if(!jointEditMode)return;
+  if(!window.opener || window.opener.closed || typeof window.opener.kidorinToggleJointPattern!=='function'){
+    setJointStatus(true,'元の画面との接続が切れています。');
+    return;
+  }
+  setJointStatus(true,'ジョイントを再計算しています…');
+  setTimeout(function(){
+    try{
+      const result=window.opener.kidorinToggleJointPattern(jointId);
+      if(!result)setJointStatus(true,'交差部を更新できませんでした。');
+      else if(result.errorCount)setJointStatus(true,result.errorCount+' 箇所でCSG演算エラーが発生しました。');
+    }catch(err){
+      console.error(err);setJointStatus(true,'ジョイント再計算でエラーが発生しました。');
+    }
+  },0);
+}
+
+function rebuildJointMarkers(){
+  group.remove(jointMarkerGroup);
+  jointMarkerGroup.traverse(disposeObject3D);
+  jointMarkerGroup=new THREE.Group();
+  clickableJointMarkers=[];
+  const panel=document.getElementById('joint-panel');
+  panel.innerHTML='';
+  const title=document.createElement('h2');title.textContent='交差部の歯パターン';panel.appendChild(title);
+  const hint=document.createElement('div');hint.className='hint';
+  hint.textContent=parentJointData.length?'3D上の色付き交差部、または一覧をクリックすると、奇数・偶数の切削担当が反転します。':'交差部は検出されませんでした。';
+  panel.appendChild(hint);
+  parentJointData.forEach(function(j){
+    const colorText=COLORS[j.selectedMortiseIndex%COLORS.length]||'#ffd166';
+    const color=parseInt(colorText.replace('#',''),16);
+    const sx=Math.max(j.size.x*1.02,1.5),sy=Math.max(j.size.y*1.02,1.5),sz=Math.max(j.size.z*1.02,1.5);
+    const geo=new THREE.BoxGeometry(sx,sy,sz);
+    const mat=new THREE.MeshBasicMaterial({color:color,transparent:true,opacity:materialViewMode==='transparent'?.52:.16,depthTest:false,depthWrite:false});
+    const marker=new THREE.Mesh(geo,mat);
+    marker.position.set(j.center.x,j.center.y,j.center.z);
+    marker.renderOrder=1200;marker.userData.isJointMarker=true;marker.userData.jointId=j.id;
+    const edge=new THREE.LineSegments(new THREE.EdgesGeometry(geo),new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:.95,depthTest:false}));
+    edge.userData.isJointMarker=true;marker.add(edge);
+    jointMarkerGroup.add(marker);clickableJointMarkers.push(marker);
+
+    const row=document.createElement('div');row.className='joint-row';row.dataset.jointId=j.id;
+    const chip=document.createElement('span');chip.className='joint-chip';chip.style.color=colorText;chip.style.background=colorText;
+    const main=document.createElement('div');main.className='joint-main';
+    const jt=document.createElement('div');jt.className='joint-title';jt.textContent=j.label+'　部品'+(j.partAIndex+1)+' × 部品'+(j.partBIndex+1);
+    const meta=document.createElement('div');meta.className='joint-meta';meta.textContent=j.splitAxis.toUpperCase()+'軸 / '+Math.round(j.splitLength*10)/10+'mm / '+j.divisions+'分割';
+    main.appendChild(jt);main.appendChild(meta);
+    const pat=document.createElement('div');pat.className='joint-pattern';pat.textContent='奇数: 部品'+(j.selectedMortiseIndex+1);
+    row.appendChild(chip);row.appendChild(main);row.appendChild(pat);
+    row.addEventListener('click',function(){requestJointToggle(j.id);});
+    panel.appendChild(row);
+  });
+  group.add(jointMarkerGroup);
+  jointMarkerGroup.visible=jointEditMode;
+  applyMaterialViewMode();
+}
+rebuildJointMarkers();
+
+window.__kidorinUpdateModel=function(newGeometries,newJoints){
+  parentGeosData=newGeometries||[];
+  parentJointData=newJoints||[];
+  loadModelData(parentGeosData,false);
+  rebuildJointMarkers();
+  setJointStatus(false);
+  update3dViewerLabels();
+};
 
 let camDist = maxDim * 1.7; 
 let camTheta = Math.PI / 2 - Math.PI / 8; 
@@ -499,7 +708,7 @@ function resetCamera(){
 }
 
 const infoEl = document.getElementById('info');
-infoEl.textContent = '部品数: ' + parentGeosData.length + '　サイズ: ' + Math.round(maxX-minX) + ' × ' + Math.round(maxY-minY) + ' × ' + Math.round(maxZ-minZ) + ' mm';
+update3dViewerLabels();
 
 function resize(){
   const W=window.innerWidth, H=window.innerHeight;
@@ -512,14 +721,28 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape') window.close();
 });
 
-let mouse = {down:false, btn:0, lastX:0, lastY:0};
+let mouse = {down:false, btn:0, lastX:0, lastY:0, downX:0, downY:0, moved:false};
+const jointRaycaster=new THREE.Raycaster();
+const jointPointer=new THREE.Vector2();
 canvas.addEventListener('contextmenu', e=>e.preventDefault());
-canvas.addEventListener('mousedown', e=>{mouse.down=true; mouse.btn=e.button; mouse.lastX=e.clientX; mouse.lastY=e.clientY;});
-window.addEventListener('mouseup', ()=>{ mouse.down=false; });
+canvas.addEventListener('mousedown', e=>{mouse.down=true;mouse.btn=e.button;mouse.lastX=mouse.downX=e.clientX;mouse.lastY=mouse.downY=e.clientY;mouse.moved=false;});
+window.addEventListener('mouseup', e=>{
+  const shouldPick=jointEditMode&&mouse.down&&mouse.btn===0&&!mouse.moved&&e.target===canvas;
+  mouse.down=false;
+  if(shouldPick){
+    const rect=canvas.getBoundingClientRect();
+    jointPointer.x=((e.clientX-rect.left)/rect.width)*2-1;
+    jointPointer.y=-((e.clientY-rect.top)/rect.height)*2+1;
+    jointRaycaster.setFromCamera(jointPointer,camera);
+    const hits=jointRaycaster.intersectObjects(clickableJointMarkers,false);
+    if(hits.length&&hits[0].object.userData.jointId)requestJointToggle(hits[0].object.userData.jointId);
+  }
+});
 
 window.addEventListener('mousemove', e=>{
   if(!mouse.down) return;
   const dx=e.clientX-mouse.lastX, dy=e.clientY-mouse.lastY;
+  if(Math.hypot(e.clientX-mouse.downX,e.clientY-mouse.downY)>4)mouse.moved=true;
   mouse.lastX=e.clientX; mouse.lastY=e.clientY;
   if(mouse.btn===0){
     camPhi -= dx * 0.008; camTheta = Math.max(0.05, Math.min(Math.PI-0.05, camTheta - dy * 0.008));
@@ -664,7 +887,7 @@ function toggleDimensions(){
 // === STLエクスポート ===
 function exportSTL(){
   var meshes = [];
-  group.traverse(function(o){ if(o.isMesh) meshes.push(o); });
+  group.traverse(function(o){ if(o.isMesh && !o.userData.isJointMarker) meshes.push(o); });
   if(meshes.length === 0){ alert('エクスポートするメッシュがありません'); return; }
 
   var totalTris = 0;
@@ -721,7 +944,7 @@ function exportSTL(){
 // === GLBエクスポート ===
 function exportGLB(){
   var meshes = [];
-  group.traverse(function(o){ if(o.isMesh) meshes.push(o); });
+  group.traverse(function(o){ if(o.isMesh && !o.userData.isJointMarker) meshes.push(o); });
   if(meshes.length === 0){ alert('エクスポートするメッシュがありません'); return; }
 
   var accessors=[], bufferViews=[], meshDefs=[], nodeDefs=[], materialDefs=[];
@@ -1009,6 +1232,13 @@ const zoomInBtn = document.getElementById('zoom-in');
 const zoomOutBtn = document.getElementById('zoom-out');
 
 let geometriesCache = [];
+// STL読込直後の形状を不変の基準として保持する。
+// ジョイントを再計算するときは、必ずこの配列からCSGをやり直す。
+let originalGeometriesCache = [];
+let jointCandidates = [];
+const jointAssignments = new Map();
+let jointViewerWindow = null;
+let lastJointBuildOptions = { withTbone: true };
 let zoomScale = 1;
 let responsiveFitScale = 1;
 
@@ -1155,8 +1385,12 @@ function loadFile(file) {
         stlArrayBufferCache = contents;
         const loader = new THREE.STLLoader();
         const geometry = loader.parse(contents);
-        geometriesCache = separateGeometries(geometry);
+        originalGeometriesCache = separateGeometries(geometry);
+        geometriesCache = originalGeometriesCache.map(geo => geo.clone());
+        jointAssignments.clear();
+        jointCandidates = detectJointCandidates(originalGeometriesCache);
         displayAsSvg(geometriesCache);
+        syncJointViewer();
     };
     reader.readAsArrayBuffer(file);
 }
@@ -2148,263 +2382,239 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function generateJoints() { processJointsLogic(false); }
 function generateTBones() { processJointsLogic(true); }
-function generateAll() { processJointsLogic(true); } // 追加：内部的にはTボーン作成と同じ一括処理ロジック
+function generateAll() { processJointsLogic(true); }
 
-function processJointsLogic(withTbone) {
-    if (!geometriesCache || geometriesCache.length < 2) {
-        alert('交差を判定するには、部品が2つ以上必要です。STLを読み込んでください。');
-        return;
-    }
-
-    let toolRadius = 3.0;
-    if (withTbone) {
-        const toolDiaInput = document.getElementById('tool-diameter');
-        if (toolDiaInput && !isNaN(parseFloat(toolDiaInput.value))) {
-            toolRadius = parseFloat(toolDiaInput.value) / 2.0;
-        }
-    }
-
-    let clearance = 0.0;
-    const clearanceInput = document.getElementById('clearance-input');
-    if (clearanceInput && !isNaN(parseFloat(clearanceInput.value))) {
-        clearance = parseFloat(clearanceInput.value);
-    }
-    let cl = clearance / 2.0;
-
-    let partData = geometriesCache.map(geo => {
-        if (!geo.attributes.normal) geo.computeVertexNormals();
-        let mesh = new THREE.Mesh(geo, new THREE.MeshNormalMaterial());
+function makeJointPartData(geometries) {
+    return geometries.map(geo => {
+        const workingGeo = geo.clone();
+        if (!workingGeo.attributes.normal) workingGeo.computeVertexNormals();
+        const mesh = new THREE.Mesh(workingGeo, new THREE.MeshNormalMaterial());
         mesh.updateMatrixWorld(true);
         return {
             csg: InternalCSG.fromMesh(mesh),
             box: new THREE.Box3().setFromObject(mesh),
-            originalGeo: geo,
+            originalGeo: workingGeo,
             modified: false
         };
     });
-
-    let jointCount = 0;
-
-    for (let i = 0; i < partData.length; i++) {
-        for (let j = i + 1; j < partData.length; j++) {
-            let boxA = partData[i].box;
-            let boxB = partData[j].box;
-
-            if (boxA.intersectsBox(boxB)) {
-                let intBox = boxA.clone().intersect(boxB);
-                let size = new THREE.Vector3();
-                intBox.getSize(size);
-
-                if (size.x > 0.1 && size.y > 0.1 && size.z > 0.1) {
-                    
-                    let dims = [
-                        { axis: 'x', val: size.x },
-                        { axis: 'y', val: size.y },
-                        { axis: 'z', val: size.z }
-                    ];
-                    dims.sort((a, b) => a.val - b.val);
-                    let splitAxis = dims[2].axis;
-
-                    let pad = 0.5;
-                    let vMin = intBox.min[splitAxis];
-                    let vMax = intBox.max[splitAxis];
-                    let splitLen = vMax - vMin;
-
-                    // 目標の歯の長さ(100〜150mm)から最適な奇数の分割数を計算
-                    let targetN = 3; 
-                    if (splitLen > 0) {
-                        let bestN = 3;
-                        let minDiff = Infinity;
-                        let maxCheckN = Math.max(3, Math.ceil(splitLen / 30)); 
-                        for (let n = 1; n <= maxCheckN; n += 2) { // 奇数のみを検証
-                            let toothLen = splitLen / n;
-                            let penalty = 0;
-                            // 100〜150mmの範囲から外れた分だけペナルティを加算
-                            if (toothLen < 100) penalty = 100 - toothLen;
-                            else if (toothLen > 150) penalty = toothLen - 150;
-                            
-                            // 範囲内の場合は中央値(125mm)に近いものを優先
-                            let totalScore = penalty * 1000 + Math.abs(toothLen - 125);
-                            if (totalScore < minDiff) {
-                                minDiff = totalScore;
-                                bestN = n;
-                            }
-                        }
-                        // 最低でも3分割（相欠きにするため）を保証
-                        targetN = Math.max(3, bestN);
-                    }
-                    let step = splitLen / targetN;
-                    let N_div = targetN;
-
-                    function processPart(part, isMortise) {
-                        let csg = part.csg;
-                        let targetBox = part.box;
-                        
-                        let wAxis = splitAxis;
-                        let remAxes = ['x', 'y', 'z'].filter(a => a !== wAxis);
-                        
-                        let l0 = targetBox.max[remAxes[0]] - targetBox.min[remAxes[0]];
-                        let l1 = targetBox.max[remAxes[1]] - targetBox.min[remAxes[1]];
-                        
-                        let dAxis = l0 > l1 ? remAxes[0] : remAxes[1];
-                        let hAxis = l0 > l1 ? remAxes[1] : remAxes[0];
-                        
-                        let extDMin = Math.abs(intBox.min[dAxis] - targetBox.min[dAxis]) < 0.1 ? pad : (cl * 2.0);
-                        let extDMax = Math.abs(targetBox.max[dAxis] - intBox.max[dAxis]) < 0.1 ? pad : (cl * 2.0);
-                        
-                        let cMin = intBox.min.clone();
-                        let cMax = intBox.max.clone();
-                        cMin[dAxis] -= extDMin; cMax[dAxis] += extDMax;
-                        cMin[hAxis] -= pad; cMax[hAxis] += pad;
-
-                        let cylH = (cMax[hAxis] - cMin[hAxis]) + 2.0;
-                        let hCenter = (cMin[hAxis] + cMax[hAxis]) / 2.0;
-
-                        function createCyl(wPos, dPos) {
-                            let geoCyl = new THREE.CylinderGeometry(toolRadius, toolRadius, cylH, 64).toNonIndexed();
-                            let mesh = new THREE.Mesh(geoCyl);
-                            if (hAxis === 'x') mesh.rotation.z = Math.PI / 2;
-                            else if (hAxis === 'z') mesh.rotation.x = Math.PI / 2;
-
-                            mesh.position[wAxis] = wPos;
-                            mesh.position[dAxis] = dPos;
-                            mesh.position[hAxis] = hCenter;
-                            mesh.updateMatrixWorld(true);
-                            return InternalCSG.fromMesh(mesh);
-                        }
-
-                        function getBoxCSG(wMin, wMax) {
-                            let sx = Math.max(0.01, cMax.x - cMin.x);
-                            let sy = Math.max(0.01, cMax.y - cMin.y);
-                            let sz = Math.max(0.01, cMax.z - cMin.z);
-                            let meshCutter = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz).toNonIndexed());
-                            
-                            let cx_w = (wMin + wMax) / 2;
-                            let sx_w = Math.max(0.01, wMax - wMin);
-                            
-                            let finalGeo = new THREE.BoxGeometry(
-                                wAxis==='x'?sx_w:sx, 
-                                wAxis==='y'?sx_w:sy, 
-                                wAxis==='z'?sx_w:sz
-                            ).toNonIndexed();
-                            
-                            meshCutter.geometry = finalGeo;
-                            meshCutter.position.set((cMin.x+cMax.x)/2, (cMin.y+cMax.y)/2, (cMin.z+cMax.z)/2);
-                            meshCutter.position[wAxis] = cx_w;
-                            meshCutter.updateMatrixWorld(true);
-                            return InternalCSG.fromMesh(meshCutter);
-                        }
-
-                        // 一括処理：四角いBoxカッターとTボーン円柱カッターをUnionで完全に合成
-                        let cutter = null;
-
-                        for (let k = 0; k < N_div; k++) {
-                            // 凹側か凸側かで切り抜くセグメントを互い違いにする
-                            let isCutSegment = isMortise ? (k % 2 === 1) : (k % 2 === 0);
-                            
-                            if (isCutSegment) {
-                                let curCutMin = vMin + k * step;
-                                let curCutMax = vMin + (k + 1) * step;
-
-                                // クリアランスと端のパディング適用
-                                if (k === 0) curCutMin -= pad;
-                                else curCutMin -= cl;
-
-                                if (k === N_div - 1) curCutMax += pad;
-                                else curCutMax += cl;
-
-                                let curBox = getBoxCSG(curCutMin, curCutMax);
-                                cutter = cutter === null ? curBox : cutter.union(curBox);
-
-                                if (withTbone) {
-                                    let w1 = curCutMin + toolRadius;
-                                    let w2 = curCutMax - toolRadius;
-
-                                    if (k > 0) { // 左側の内角にTボーンを追加
-                                        if (extDMin === (cl * 2.0)) cutter = cutter.union(createCyl(w1, cMin[dAxis]));
-                                        if (extDMax === (cl * 2.0)) cutter = cutter.union(createCyl(w1, cMax[dAxis]));
-                                    }
-                                    if (k < N_div - 1) { // 右側の内角にTボーンを追加
-                                        if (extDMin === (cl * 2.0)) cutter = cutter.union(createCyl(w2, cMin[dAxis]));
-                                        if (extDMax === (cl * 2.0)) cutter = cutter.union(createCyl(w2, cMax[dAxis]));
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if (cutter === null) return csg; // 安全策
-                        
-                        // 一体化したカッター形状を用いて、ベースモデルから1回だけ引き算
-                        return csg.subtract(cutter);
-                    }
-
-                    let lenA = boxA.max[splitAxis] - boxA.min[splitAxis];
-                    let lenB = boxB.max[splitAxis] - boxB.min[splitAxis];
-
-                    try {
-                        if (lenA > lenB) {
-                            partData[i].csg = processPart(partData[i], true);
-                            partData[j].csg = processPart(partData[j], false);
-                        } else {
-                            partData[j].csg = processPart(partData[j], true);
-                            partData[i].csg = processPart(partData[i], false);
-                        }
-                        partData[i].modified = true;
-                        partData[j].modified = true;
-                        jointCount++;
-                    } catch (e) {
-                        console.error("CSG演算エラー:", e);
-                    }
-                }
-            }
-        }
-    }
-
-    if (jointCount > 0) {
-        // ===== レイアウト・タブマーカー保存 =====
-        var svgOld=svgContainer.querySelector('svg'),savedL={},savedTabs={};
-        if(svgOld) svgOld.querySelectorAll('g[data-x][id^="part-"]').forEach(function(el){
-            savedL[el.id]={x:parseFloat(el.dataset.x||0),y:parseFloat(el.dataset.y||0),angle:parseFloat(el.dataset.angle||0)};
-            // タブマーカー座標を保存
-            var tabList=[];
-            var rg=el.querySelector('.rot-group');
-            if(rg) rg.querySelectorAll('.tab-marker').forEach(function(m){
-                tabList.push({tx:parseFloat(m.getAttribute('data-tx')||0),ty:parseFloat(m.getAttribute('data-ty')||0)});
-            });
-            if(tabList.length>0) savedTabs[el.id]=tabList;
-        });
-        geometriesCache = partData.map(part => {
-            if (part.modified) {
-                return InternalCSG.toMesh(part.csg, new THREE.Matrix4()).geometry;
-            } else {
-                return part.originalGeo;
-            }
-        });
-        displayAsSvg(geometriesCache);
-        // ===== レイアウト・タブマーカー復元 =====
-        var svgNew=svgContainer.querySelector('svg');
-        if(svgNew&&Object.keys(savedL).length>0){
-            svgNew.querySelectorAll('g[data-x][id^="part-"]').forEach(function(el){
-                var s=savedL[el.id];
-                if(s){el.dataset.x=s.x;el.dataset.y=s.y;el.dataset.angle=s.angle;updateTransform(el);}
-                // タブマーカー復元
-                var tabs=savedTabs[el.id];
-                if(tabs&&tabs.length>0){
-                    var rg=el.querySelector('.rot-group');
-                    if(rg) tabs.forEach(function(t){ drawTabMarker(rg, t.tx, t.ty); });
-                }
-            });
-            recalcViewBox(svgNew, { preserveScale: true });
-            updateLearningPanels();
-        }
-        let msgType = '相欠きジョイント';
-        if (withTbone) msgType += '（Tボーン付き）';
-        if (clearance > 0) msgType += `\nクリアランス: ${clearance}mm`;
-        alert(`${jointCount} 箇所の交差部に${msgType}を生成しました。`);
-    } else {
-        alert('交差している部品が見つかりませんでした。');
-    }
 }
+
+function chooseJointDivisionCount(splitLen) {
+    let bestN = 3;
+    let minDiff = Infinity;
+    const maxCheckN = Math.max(3, Math.ceil(splitLen / 30));
+    for (let n = 1; n <= maxCheckN; n += 2) {
+        const toothLen = splitLen / n;
+        let penalty = 0;
+        if (toothLen < 100) penalty = 100 - toothLen;
+        else if (toothLen > 150) penalty = toothLen - 150;
+        const score = penalty * 1000 + Math.abs(toothLen - 125);
+        if (score < minDiff) { minDiff = score; bestN = n; }
+    }
+    return Math.max(3, bestN);
+}
+
+function detectJointCandidates(geometries) {
+    if (!geometries || geometries.length < 2) return [];
+    const boxes = geometries.map(geo => {
+        const mesh = new THREE.Mesh(geo);
+        mesh.updateMatrixWorld(true);
+        return new THREE.Box3().setFromObject(mesh);
+    });
+    const found = [];
+    for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+            const boxA = boxes[i], boxB = boxes[j];
+            if (!boxA.intersectsBox(boxB)) continue;
+            const intBox = boxA.clone().intersect(boxB);
+            const size = new THREE.Vector3();
+            const center = new THREE.Vector3();
+            intBox.getSize(size);
+            intBox.getCenter(center);
+            if (size.x <= 0.1 || size.y <= 0.1 || size.z <= 0.1) continue;
+            const dims = [
+                {axis:'x', val:size.x}, {axis:'y', val:size.y}, {axis:'z', val:size.z}
+            ].sort((a,b) => a.val - b.val);
+            const splitAxis = dims[2].axis;
+            const splitLength = size[splitAxis];
+            const divisions = chooseJointDivisionCount(splitLength);
+            const lenA = boxA.max[splitAxis] - boxA.min[splitAxis];
+            const lenB = boxB.max[splitAxis] - boxB.min[splitAxis];
+            const defaultMortiseIndex = lenA > lenB ? i : j;
+            const q = v => Math.round(v * 100) / 100;
+            const id = `joint-${i}-${j}-${splitAxis}-${q(center.x)}-${q(center.y)}-${q(center.z)}`;
+            const selected = jointAssignments.has(id) ? jointAssignments.get(id) : defaultMortiseIndex;
+            jointAssignments.set(id, selected === i || selected === j ? selected : defaultMortiseIndex);
+            found.push({
+                id, label:`J${found.length + 1}`, partAIndex:i, partBIndex:j,
+                splitAxis, splitLength, divisions, defaultMortiseIndex,
+                selectedMortiseIndex: jointAssignments.get(id),
+                center:{x:center.x,y:center.y,z:center.z},
+                size:{x:size.x,y:size.y,z:size.z},
+                min:{x:intBox.min.x,y:intBox.min.y,z:intBox.min.z},
+                max:{x:intBox.max.x,y:intBox.max.y,z:intBox.max.z}
+            });
+        }
+    }
+    return found;
+}
+
+function makeJointCutterResult(part, candidate, isMortise, options) {
+    const withTbone = !!options.withTbone;
+    const toolRadius = options.toolRadius;
+    const cl = options.clearance / 2.0;
+    const pad = 0.5;
+    const intBox = new THREE.Box3(
+        new THREE.Vector3(candidate.min.x, candidate.min.y, candidate.min.z),
+        new THREE.Vector3(candidate.max.x, candidate.max.y, candidate.max.z)
+    );
+    const targetBox = part.box;
+    const wAxis = candidate.splitAxis;
+    const remAxes = ['x','y','z'].filter(a => a !== wAxis);
+    const l0 = targetBox.max[remAxes[0]] - targetBox.min[remAxes[0]];
+    const l1 = targetBox.max[remAxes[1]] - targetBox.min[remAxes[1]];
+    const dAxis = l0 > l1 ? remAxes[0] : remAxes[1];
+    const hAxis = l0 > l1 ? remAxes[1] : remAxes[0];
+    const extDMin = Math.abs(intBox.min[dAxis] - targetBox.min[dAxis]) < 0.1 ? pad : cl * 2.0;
+    const extDMax = Math.abs(targetBox.max[dAxis] - intBox.max[dAxis]) < 0.1 ? pad : cl * 2.0;
+    const cMin = intBox.min.clone(), cMax = intBox.max.clone();
+    cMin[dAxis] -= extDMin; cMax[dAxis] += extDMax;
+    cMin[hAxis] -= pad; cMax[hAxis] += pad;
+    const vMin = intBox.min[wAxis], vMax = intBox.max[wAxis];
+    const step = (vMax - vMin) / candidate.divisions;
+    const cylH = (cMax[hAxis] - cMin[hAxis]) + 2.0;
+    const hCenter = (cMin[hAxis] + cMax[hAxis]) / 2.0;
+
+    function createCyl(wPos, dPos) {
+        const mesh = new THREE.Mesh(new THREE.CylinderGeometry(toolRadius, toolRadius, cylH, 64).toNonIndexed());
+        if (hAxis === 'x') mesh.rotation.z = Math.PI / 2;
+        else if (hAxis === 'z') mesh.rotation.x = Math.PI / 2;
+        mesh.position[wAxis] = wPos; mesh.position[dAxis] = dPos; mesh.position[hAxis] = hCenter;
+        mesh.updateMatrixWorld(true);
+        return InternalCSG.fromMesh(mesh);
+    }
+
+    function getBoxCSG(wMin, wMax) {
+        const sx = Math.max(0.01, cMax.x-cMin.x), sy = Math.max(0.01, cMax.y-cMin.y), sz = Math.max(0.01, cMax.z-cMin.z);
+        const sw = Math.max(0.01, wMax-wMin);
+        const geo = new THREE.BoxGeometry(wAxis==='x'?sw:sx, wAxis==='y'?sw:sy, wAxis==='z'?sw:sz).toNonIndexed();
+        const mesh = new THREE.Mesh(geo);
+        mesh.position.set((cMin.x+cMax.x)/2, (cMin.y+cMax.y)/2, (cMin.z+cMax.z)/2);
+        mesh.position[wAxis] = (wMin+wMax)/2;
+        mesh.updateMatrixWorld(true);
+        return InternalCSG.fromMesh(mesh);
+    }
+
+    let cutter = null;
+    for (let k = 0; k < candidate.divisions; k++) {
+        if (!(isMortise ? k % 2 === 1 : k % 2 === 0)) continue;
+        let cutMin = vMin + k * step, cutMax = vMin + (k+1) * step;
+        cutMin -= k === 0 ? pad : cl;
+        cutMax += k === candidate.divisions-1 ? pad : cl;
+        const boxCsg = getBoxCSG(cutMin, cutMax);
+        cutter = cutter === null ? boxCsg : cutter.union(boxCsg);
+        if (withTbone) {
+            const w1 = cutMin + toolRadius, w2 = cutMax - toolRadius;
+            if (k > 0) {
+                if (extDMin === cl*2.0) cutter = cutter.union(createCyl(w1,cMin[dAxis]));
+                if (extDMax === cl*2.0) cutter = cutter.union(createCyl(w1,cMax[dAxis]));
+            }
+            if (k < candidate.divisions-1) {
+                if (extDMin === cl*2.0) cutter = cutter.union(createCyl(w2,cMin[dAxis]));
+                if (extDMax === cl*2.0) cutter = cutter.union(createCyl(w2,cMax[dAxis]));
+            }
+        }
+    }
+    return cutter === null ? part.csg : part.csg.subtract(cutter);
+}
+
+function captureCurrentLayoutState() {
+    const state = {layout:{}, tabs:{}};
+    const svg = svgContainer.querySelector('svg');
+    if (!svg) return state;
+    svg.querySelectorAll('g[data-x][id^="part-"]').forEach(el => {
+        state.layout[el.id] = {x:parseFloat(el.dataset.x||0),y:parseFloat(el.dataset.y||0),angle:parseFloat(el.dataset.angle||0)};
+        const list = [];
+        const rg = el.querySelector('.rot-group');
+        if (rg) rg.querySelectorAll('.tab-marker').forEach(m => list.push({tx:parseFloat(m.getAttribute('data-tx')||0),ty:parseFloat(m.getAttribute('data-ty')||0)}));
+        if (list.length) state.tabs[el.id] = list;
+    });
+    return state;
+}
+
+function restoreCurrentLayoutState(state) {
+    const svg = svgContainer.querySelector('svg');
+    if (!svg || !state) return;
+    svg.querySelectorAll('g[data-x][id^="part-"]').forEach(el => {
+        const saved = state.layout[el.id];
+        if (saved) { el.dataset.x=saved.x; el.dataset.y=saved.y; el.dataset.angle=saved.angle; updateTransform(el); }
+        const tabs = state.tabs[el.id], rg = el.querySelector('.rot-group');
+        if (rg && tabs) tabs.forEach(t => drawTabMarker(rg,t.tx,t.ty));
+    });
+    recalcViewBox(svg,{preserveScale:true});
+    updateLearningPanels();
+}
+
+function currentJointOptions(withTbone) {
+    const tool = parseFloat(document.getElementById('tool-diameter')?.value);
+    const clearance = parseFloat(document.getElementById('clearance-input')?.value);
+    return {withTbone:!!withTbone,toolRadius:Number.isFinite(tool)&&tool>0?tool/2:3,clearance:Number.isFinite(clearance)?clearance:0};
+}
+
+function rebuildJointModel(withTbone, silent) {
+    if (!originalGeometriesCache.length) return {jointCount:0,errorCount:0};
+    const savedState = captureCurrentLayoutState();
+    const options = currentJointOptions(withTbone);
+    lastJointBuildOptions = {withTbone:!!withTbone};
+    const partData = makeJointPartData(originalGeometriesCache);
+    let jointCount = 0, errorCount = 0;
+    for (const candidate of jointCandidates) {
+        const selected = jointAssignments.get(candidate.id) ?? candidate.defaultMortiseIndex;
+        candidate.selectedMortiseIndex = selected;
+        try {
+            // 両側の演算が成功してから同時に反映し、片側だけの加工結果を残さない。
+            const nextA = makeJointCutterResult(partData[candidate.partAIndex], candidate, selected===candidate.partAIndex, options);
+            const nextB = makeJointCutterResult(partData[candidate.partBIndex], candidate, selected===candidate.partBIndex, options);
+            partData[candidate.partAIndex].csg = nextA;
+            partData[candidate.partBIndex].csg = nextB;
+            partData[candidate.partAIndex].modified = true;
+            partData[candidate.partBIndex].modified = true;
+            jointCount++;
+        } catch (e) {
+            errorCount++;
+            console.error('CSG演算エラー:',candidate.id,e);
+        }
+    }
+    geometriesCache = partData.map(part => part.modified ? InternalCSG.toMesh(part.csg,new THREE.Matrix4()).geometry : part.originalGeo.clone());
+    displayAsSvg(geometriesCache);
+    restoreCurrentLayoutState(savedState);
+    syncJointViewer();
+    if (!silent) {
+        if (jointCount) alert(`${jointCount} 箇所の交差部に相欠きジョイント${withTbone?'（Tボーン付き）':''}を生成しました。${errorCount?`\n${errorCount} 箇所で演算エラーが発生しました。`:''}`);
+        else alert('交差している部品が見つかりませんでした。');
+    }
+    return {jointCount,errorCount};
+}
+
+function processJointsLogic(withTbone) {
+    if (!originalGeometriesCache || originalGeometriesCache.length < 2) {
+        alert('交差を判定するには、部品が2つ以上必要です。STLを読み込んでください。');
+        return;
+    }
+    jointCandidates = detectJointCandidates(originalGeometriesCache);
+    rebuildJointModel(withTbone,false);
+}
+
+window.kidorinToggleJointPattern = function(jointId) {
+    const candidate = jointCandidates.find(j => j.id === jointId);
+    if (!candidate) return null;
+    const current = jointAssignments.get(jointId) ?? candidate.defaultMortiseIndex;
+    const next = current === candidate.partAIndex ? candidate.partBIndex : candidate.partAIndex;
+    jointAssignments.set(jointId,next);
+    candidate.selectedMortiseIndex = next;
+    const build = rebuildJointModel(lastJointBuildOptions.withTbone,true);
+    return {id:jointId,selectedMortiseIndex:next,errorCount:build.errorCount};
+};
 
 
 
@@ -2431,10 +2641,14 @@ if (resetStlBtn) {
         const geometry = loader.parse(stlArrayBufferCache);
         
         // ジオメトリを部品ごとに分離してキャッシュを上書き
-        geometriesCache = separateGeometries(geometry);
+        originalGeometriesCache = separateGeometries(geometry);
+        geometriesCache = originalGeometriesCache.map(geo => geo.clone());
+        jointAssignments.clear();
+        jointCandidates = detectJointCandidates(originalGeometriesCache);
         
         // 2Dビューを再描画（板への配置も初期状態に戻る）
         displayAsSvg(geometriesCache);
+        syncJointViewer();
         
         // ※完了後の alert() は削除しました
     });
