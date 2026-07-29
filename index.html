@@ -8,7 +8,7 @@
   <style>
     .tool-settings {
       display: flex;
-      flex-wrap: nowrap;
+      flex-wrap: wrap;
       align-items: center;
       gap: 5px;
       background-color: #f8f9fa;
@@ -33,93 +33,118 @@
 </head>
 <body>
 
-<div id="title-row">
+<div id="app-header">
   <img src="kidorin.png" alt="きどりん" class="app-icon" onerror="this.style.display='none'">
   <div class="title-text">
     <h1>STL to 木取り図作成「きどりんfor CNC」</h1>
     <div id="docTitle" class="doc-title pdf-only">STL to 木取り図作成「きどりんfor CNC」　STLのファイル名：-</div>
-    <p>STLファイルをアップロードし、部品をドラッグ＆ドロップで配置してください。</p>
   </div>
-</div>
-
-<div id="top-controls">
-  <input id="stl-input" type="file" accept=".stl">
-  <div id="zoom-controls">
-    <button id="zoom-in">Zoom +</button>
-    <button id="zoom-out">Zoom -</button>
-    <span id="help-text">　部品は，マウスでドラッグ。右クリック／ダブルタップで90度回転　</span>
+  <div id="header-file-controls">
+    <input id="stl-input" type="file" accept=".stl">
     <button id="view3d-button" type="button" class="help-btn" style="background-color: #007bff; color: white;">3D表示</button>
     <button id="helpBtn" type="button" class="help-btn">ヘルプ</button>
   </div>
 </div>
 
-<div id="settings-panel">
-  <!-- 1行目：数値入力 + 主要ボタン群 -->
-  <div class="board-settings">
-    <div class="input-group">
-      <label>板1の長さ (mm)</label>
-      <input id="board-length" type="number" value="900">
-    </div>
-    <div class="input-group">
-      <label>板1の幅 (mm)</label>
-      <input id="board-width" type="number" value="900">
-    </div>
-    <div class="input-group">
-      <label>部品の間隔 (mm)</label>
-      <input id="margin" type="number" value="20">
+<div id="app-layout">
+
+  <aside id="left-sidebar">
+
+    <div id="zoom-controls">
+      <button id="zoom-in">Zoom +</button>
+      <button id="zoom-out">Zoom -</button>
+      <span id="help-text">部品は，マウスでドラッグ。右クリック／ダブルタップで90度回転</span>
     </div>
 
-    <!-- 1行目：板を追加〜SVG保存 -->
-    <div class="main-buttons">
-      <button id="add-board-button" type="button">板を追加</button>
-      <button id="update-layout-button" type="button">レイアウト初期化</button>
-      <button id="pdf-button" type="button">PDF表示</button>
-      <button id="svg-button" type="button" style="background-color: #6f42c1; color: white;">SVG保存</button>
+    <div id="settings-panel">
+      <!-- 板設定 + 主要ボタン群 -->
+      <div class="board-settings">
+        <div class="input-group">
+          <label>板1の長さ (mm)</label>
+          <input id="board-length" type="number" value="900">
+        </div>
+        <div class="input-group">
+          <label>板1の幅 (mm)</label>
+          <input id="board-width" type="number" value="900">
+        </div>
+        <div class="input-group">
+          <label>部品の間隔 (mm)</label>
+          <input id="margin" type="number" value="20">
+        </div>
+
+        <div class="main-buttons">
+          <button id="add-board-button" type="button">板を追加</button>
+          <button id="update-layout-button" type="button">レイアウト初期化</button>
+          <button id="pdf-button" type="button">PDF表示</button>
+          <button id="svg-button" type="button" style="background-color: #6f42c1; color: white;">SVG保存</button>
+        </div>
+      </div>
+
+      <!-- ジョイント・Tボーン・タブ・Gコード -->
+      <div class="joint-buttons-row">
+        <button id="reset-stl-button" type="button" class="btn-reset">STL初期状態に戻す</button>
+        <button id="generate-joints-button" type="button" style="background-color: #28a745; color: white;">ジョイント生成</button>
+        <div class="tool-settings">
+          <label for="tool-diameter">ミル径(mm)</label>
+          <select id="tool-diameter" style="padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:13px; cursor:pointer; background:#fff;">
+            <option value="6">6 mm</option>
+            <option value="12">12 mm</option>
+          </select>
+          <label for="clearance-input" style="margin-left: 4px;">クリアランス(mm)</label>
+          <input id="clearance-input" type="number" value="0.2" step="0.1">
+          <button id="generate-tbone-button" type="button" style="background-color: #17a2b8; color: white; margin-left: 4px;">Tボーン作成</button>
+          <button id="generate-all-button" type="button" style="background-color: #ffc107; color: #333; margin-left: 4px; font-weight: bold;">ジョイント＆Tボーン一括生成</button>
+        </div>
+        <button id="tab-button" type="button" style="background-color: #e67e22 !important; color: white !important;">タブ設定</button>
+        <div class="tab-settings" style="display:flex; flex-wrap:wrap; align-items:center; gap:4px; padding:4px 6px; border:1px solid #ddd; border-radius:4px; background:#fafafa;">
+          <button id="auto-tab-button" type="button" style="background-color: #d35400; color: white;">タブ自動配置</button>
+          <label for="tab-spacing-input" style="margin-left:4px; font-size:12px;" title="300mm以上の辺で、25%〜75%の内側に追加するタブの間隔">間隔(mm)</label>
+          <input id="tab-spacing-input" type="number" value="150" step="10" style="width:56px;" title="300mm以上の辺で、25%〜75%の内側に追加するタブの間隔">
+          <label for="tab-margin-input" style="margin-left:4px; font-size:12px;" title="辺の端からこの距離以内にはタブを置きません">端マージン(mm)</label>
+          <input id="tab-margin-input" type="number" value="15" step="1" style="width:48px;" title="辺の端からこの距離以内にはタブを置きません">
+          <label for="tab-max-per-part-input" style="margin-left:4px; font-size:12px;" title="外周に配置するタブの上限。25%/75%の基準タブを優先して残します">上限数/部品</label>
+          <input id="tab-max-per-part-input" type="number" value="12" step="1" style="width:40px;" title="外周に配置するタブの上限。25%/75%の基準タブを優先して残します">
+          <label style="margin-left:6px; font-size:12px;">
+            <input id="tab-include-slots-checkbox" type="checkbox" checked> スロットにも配置
+          </label>
+          <label style="margin-left:4px; font-size:12px;">
+            <input id="tab-opposite-walls-checkbox" type="checkbox" checked title="はめ込み穴の対向する2つの壁にタブを置きます（位置は互いにずらします）"> 対向2壁
+          </label>
+          <label style="margin-left:4px; font-size:12px;">
+            <input id="tab-keep-existing-checkbox" type="checkbox" checked> 既存タブを残す
+          </label>
+        </div>
+        <button id="gcode-button" type="button" style="background-color: #495057; color: white;">Mach2/3用Gコード生成</button>
+        <button id="gcode-viewer-button" type="button" style="background-color: #007bff; color: white;">Gコードビュワー</button>
+      </div>
+
+      <div id="extra-boards"></div>
     </div>
-  </div>
 
-  <!-- 2行目：STL初期状態に戻す〜Gコード生成 -->
-  <div class="joint-buttons-row">
-    <button id="reset-stl-button" type="button" class="btn-reset">STL初期状態に戻す</button>
-    <button id="generate-joints-button" type="button" style="background-color: #28a745; color: white;">ジョイント生成</button>
-    <div class="tool-settings">
-      <label for="tool-diameter">ミル径(mm)</label>
-      <select id="tool-diameter" style="padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:13px; cursor:pointer; background:#fff;">
-        <option value="6">6 mm</option>
-        <option value="12">12 mm</option>
-      </select>
-      <label for="clearance-input" style="margin-left: 4px;">クリアランス(mm)</label>
-      <input id="clearance-input" type="number" value="0.2" step="0.1">
-      <button id="generate-tbone-button" type="button" style="background-color: #17a2b8; color: white; margin-left: 4px;">Tボーン作成</button>
-      <button id="generate-all-button" type="button" style="background-color: #ffc107; color: #333; margin-left: 4px; font-weight: bold;">ジョイント＆Tボーン一括生成</button>
+    <div id="learning-panels">
+      <div class="info-card">
+        <h2>板の歩留まり</h2>
+        <div id="yieldInfo" class="info-body">STLを読み込むと材料利用率が表示されます。</div>
+      </div>
+      <div class="info-card">
+        <h2>木目方向の注意</h2>
+        <div id="grainWarnings" class="info-body">縦長の部品の長い方向が木目方向と一致しないときに注意が表示されます。</div>
+      </div>
+      <div class="info-card bom-card">
+        <h2>部品リスト（BOM）</h2>
+        <div id="bomList" class="info-body">STLを読み込むと部品リストが表示されます。</div>
+      </div>
     </div>
-    <button id="tab-button" type="button" style="background-color: #e67e22 !important; color: white !important;">タブ設定</button>
-    <button id="gcode-button" type="button" style="background-color: #495057; color: white;">Mach2/3用Gコード生成</button>
-    <button id="gcode-viewer-button" type="button" style="background-color: #007bff; color: white;">Gコードビュワー</button>
-  </div>
 
-  <div id="extra-boards"></div>
-</div>
+  </aside>
 
-<div id="svg-container">
-  <p>ここにSTLファイルをドロップするか、上のボタンから選択してください。</p>
-</div>
+  <main id="main-view">
+    <div id="svg-container">
+      <p>ここにSTLファイルをドロップするか、左のボタンから選択してください。</p>
+    </div>
+    <div id="boardInfo" class="board-info pdf-only"></div>
+  </main>
 
-<div id="boardInfo" class="board-info pdf-only"></div>
-
-<div id="learning-panels">
-  <div class="info-card">
-    <h2>板の歩留まり</h2>
-    <div id="yieldInfo" class="info-body">STLを読み込むと材料利用率が表示されます。</div>
-  </div>
-  <div class="info-card">
-    <h2>木目方向の注意</h2>
-    <div id="grainWarnings" class="info-body">縦長の部品の長い方向が木目方向と一致しないときに注意が表示されます。</div>
-  </div>
-  <div class="info-card bom-card">
-    <h2>部品リスト（BOM）</h2>
-    <div id="bomList" class="info-body">STLを読み込むと部品リストが表示されます。</div>
-  </div>
 </div>
 
 <!-- Gコードビュワー オーバーレイ -->

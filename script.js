@@ -3343,7 +3343,7 @@ function normalizeNumericInput(el){
  * - 鋭角コーナーは bevel 処理で安定化（ジョイント形状対応）
  * - C/A セグメントは折れ線にサンプリング
  */
-function applyToolRadiusOffset(segs, radius) {
+function applyToolRadiusOffset(segs, radius, partBBox) {
     if (!radius || radius <= 0) return segs;
 
     // ============================================================
@@ -3625,8 +3625,86 @@ function applyToolRadiusOffset(segs, radius) {
         else if (cur) cur.push(seg);
     }
 
+    // ---- 1b) 各サブパスがスロット/穴かどうかを判定（複数の手がかりを組み合わせ） ----
+    // 手がかり1: 同じsegsに他のサブパスがあり、その内側にある → 穴
+    // 手がかり2: partBBoxが渡されていて、サブパスBBoxが部品BBoxから内側に離れている → 穴
+    // 手がかり3: サブパスの短辺が閾値（40mm）以下 → 穴（板厚由来のスロットを想定）
+    function spToVerts(sp) {
+        const vs = []; let px=0, py=0, sx=0, sy=0;
+        for (const s of sp) {
+            if (s.cmd==='M') { vs.push({x:s.x,y:s.y}); px=sx=s.x; py=sy=s.y; }
+            else if (s.cmd==='L') { vs.push({x:s.x,y:s.y}); px=s.x; py=s.y; }
+            else if (s.cmd==='C') { vs.push({x:s.x,y:s.y}); px=s.x; py=s.y; }
+            else if (s.cmd==='A') { vs.push({x:s.x,y:s.y}); px=s.x; py=s.y; }
+        }
+        return vs;
+    }
+    function bboxOf(vs) {
+        let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+        for (const v of vs) {
+            if (v.x < minX) minX = v.x; if (v.x > maxX) maxX = v.x;
+            if (v.y < minY) minY = v.y; if (v.y > maxY) maxY = v.y;
+        }
+        return {minX, minY, maxX, maxY, w: maxX-minX, h: maxY-minY};
+    }
+    function centroid(vs) {
+        let cx=0, cy=0;
+        for (const v of vs) { cx+=v.x; cy+=v.y; }
+        return {x:cx/vs.length, y:cy/vs.length};
+    }
+    const spVertsAll = subpaths.map(sp => spToVerts(sp));
+    const spBBoxes = spVertsAll.map(vs => vs.length ? bboxOf(vs) : null);
+
+    const SLOT_SHORT_EDGE_LIMIT = 20;  // 短辺20mm未満は穴・スロット確定
+    const EDGE_MARGIN = 5;              // 部品BBoxの端から5mm以内なら「端に接する」
+
+    const isHoleFlags = subpaths.map((sp, i) => {
+        const vs = spVertsAll[i];
+        const bb = spBBoxes[i];
+        if (!vs || vs.length < 3 || !bb) return false;
+
+        // 手がかり1（最優先・穴確定）: 短辺が板厚程度（20mm未満）→ 穴・スロット確定
+        // ジョイントスロットは板厚 + T-boneコーナー膨張で幅約12〜19mm。
+        // 通常の外周部品は最小でも20mm以上あるため、これで確実に判別できる。
+        if (Math.min(bb.w, bb.h) < SLOT_SHORT_EDGE_LIMIT) return true;
+
+        // 手がかり2（外周確定）: 部品BBoxの全端に接する → 外周
+        if (partBBox) {
+            const t0L = Math.abs(bb.minX - partBBox.minX) < EDGE_MARGIN;
+            const t0R = Math.abs(bb.maxX - partBBox.maxX) < EDGE_MARGIN;
+            const t0T = Math.abs(bb.minY - partBBox.minY) < EDGE_MARGIN;
+            const t0B = Math.abs(bb.maxY - partBBox.maxY) < EDGE_MARGIN;
+            if (t0L && t0R && t0T && t0B) return false;
+        }
+
+        // 手がかり3: 他のサブパスの内側にある → 穴
+        const c = centroid(vs);
+        for (let j = 0; j < subpaths.length; j++) {
+            if (i === j) continue;
+            const vs2 = spVertsAll[j];
+            if (vs2.length < 3) continue;
+            const bb2 = spBBoxes[j];
+            if (bb2.w * bb2.h < bb.w * bb.h) continue;
+            if (pointInPoly(c, vs2)) return true;
+        }
+
+        // 手がかり4: partBBoxが渡されていて、部品BBox端に接していない → 穴
+        if (partBBox) {
+            const touchLeft   = Math.abs(bb.minX - partBBox.minX) < EDGE_MARGIN;
+            const touchRight  = Math.abs(bb.maxX - partBBox.maxX) < EDGE_MARGIN;
+            const touchTop    = Math.abs(bb.minY - partBBox.minY) < EDGE_MARGIN;
+            const touchBottom = Math.abs(bb.maxY - partBBox.maxY) < EDGE_MARGIN;
+            if (!touchLeft && !touchRight && !touchTop && !touchBottom) return true;
+        }
+
+        return false;
+    });
+
     const result = [];
-    for (const sp of subpaths) {
+    for (let spIdx = 0; spIdx < subpaths.length; spIdx++) {
+        const sp = subpaths[spIdx];
+        const isHoleContour = isHoleFlags[spIdx];
+
         // ---- 2) C/Aを折れ線化して閉ポリゴン頂点列にする ----
         const verts = [];
         let px = 0, py = 0;
@@ -3663,9 +3741,9 @@ function applyToolRadiusOffset(segs, radius) {
 
         const n = verts.length;
 
-        // ---- 3) 各辺の外側法線を決める ----
-        // 2候補のうち、辺の中点をradius/2だけ動かした点がポリゴン外側にある方を採用する。
-        // これによりY軸下向きSVG座標でも、向きに依存せず外側へ補正できる。
+        // ---- 3) 各辺の法線方向を決める ----
+        // 外周（isHole=false）: 外側候補（+radius）を選択
+        // 穴/スロット（isHole=true）: 外側候補の逆（内側、-radius）を選択
         const normals = [];
         for (let i = 0; i < n; i++) {
             const a = verts[i], b = verts[(i+1)%n];
@@ -3679,7 +3757,12 @@ function applyToolRadiusOffset(segs, radius) {
             const p2 = {x: mx + c2.nx * radius * 0.5, y: my + c2.ny * radius * 0.5};
             const d1 = signedDistanceToPolygon(p1, verts);
             const d2 = signedDistanceToPolygon(p2, verts);
-            normals.push(d1 >= d2 ? {...c1, len} : {...c2, len});
+            if (!isHoleContour) {
+                normals.push(d1 >= d2 ? {...c1, len} : {...c2, len});
+            } else {
+                // 穴/スロット: 外側候補の逆を採用（内側オフセット）
+                normals.push(d1 >= d2 ? {...c2, len} : {...c1, len});
+            }
         }
 
         // ---- 4) 各辺を外側へ平行移動し、隣接オフセット線の交点を求める ----
@@ -3728,9 +3811,9 @@ function applyToolRadiusOffset(segs, radius) {
         if (final.length < 3) { result.push(...sp); continue; }
 
         // ---- 5) 90度外角に逃げ加工を追加 ----
-        // 曲線部は保持し、miter角だけに外側への短い往復を加える。
-        const lineCorners = extractLineLineCorners(sp);
-        const reliefFinal = insertCornerReliefs(final, lineCorners);
+        // 穴・スロット（内側オフセット）ではコーナー逃げ不要・有害なのでスキップ
+        const lineCorners = isHoleContour ? [] : extractLineLineCorners(sp);
+        const reliefFinal = isHoleContour ? final : insertCornerReliefs(final, lineCorners);
 
         // ---- 6) 結果セグメント生成 ----
         result.push({cmd:'M', x:reliefFinal[0].x, y:reliefFinal[0].y});
@@ -4066,11 +4149,33 @@ function generateAndDownloadGcode() {
             if (pathEls.length === 0) pathEls = partEl.querySelectorAll('path');
             if (pathEls.length === 0) return;
 
+            // 部品全体のBBoxを事前計算（スロット/外周判定用）
+            // 部品内の全pathの全サブパスから最外殻のBBoxを求める
+            const allPathSegs = [];
             pathEls.forEach(pe => {
-                const segs = getTransformedSegments(pe, offsetX, offsetY, angle, partW, partH);
+                const s = getTransformedSegments(pe, offsetX, offsetY, angle, partW, partH);
+                allPathSegs.push(s);
+            });
+            let partBBox = null;
+            {
+                let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+                let count = 0;
+                for (const s of allPathSegs) {
+                    for (const seg of s) {
+                        if (seg.x === undefined || seg.y === undefined) continue;
+                        if (seg.x < minX) minX = seg.x; if (seg.x > maxX) maxX = seg.x;
+                        if (seg.y < minY) minY = seg.y; if (seg.y > maxY) maxY = seg.y;
+                        count++;
+                    }
+                }
+                if (count > 0) partBBox = {minX, minY, maxX, maxY, w: maxX-minX, h: maxY-minY};
+            }
+
+            pathEls.forEach((pe, peIdx) => {
+                const segs = allPathSegs[peIdx];
                 if (segs.length === 0) return;
                 // 工具中心線を外側へミル半径分オフセットする。
-                const offsetSegs = applyToolRadiusOffset(segs, millDiam / 2);
+                const offsetSegs = applyToolRadiusOffset(segs, millDiam / 2, partBBox);
                 const offsetTabs = snapTabsToOffsetOutline(tabSegments, offsetSegs);
                 const tabbedSegs = insertTabsIntoSegments(offsetSegs, offsetTabs, pass2Z, TAB_HEIGHT_Z, svgH);
                 segmentsToGcodeLines(tabbedSegs, svgH, feedRate, plungeRate, clearH, pass1Z, pass2Z, addLine, gcLines, gcodeStats);
@@ -4254,6 +4359,686 @@ function clearAllTabMarkers() {
     svg.querySelectorAll('.tab-marker').forEach(m => m.parentNode && m.parentNode.removeChild(m));
 }
 
+// ================================================================
+// タブ自動配置機能
+// ================================================================
+// 要件定義: 「きどりん for CNC」タブ自動配置機能 要件定義（提案）に準拠。
+// 外周輪郭・内側輪郭（ジョイントスロット等の穴）の両方を対象とし、
+// 既存の手動タブ機能（tab-marker DOM構造）にそのまま統合される。
+
+const AUTO_TAB_SLOT_SHORT_EDGE_LIMIT = 20; // 短辺20mm未満は穴・スロット確定（Gコード生成側と同じ基準）
+const AUTO_TAB_EDGE_MARGIN = 5;             // 部品BBoxの端から5mm以内なら「端に接する」
+const AUTO_TAB_ANGLE_TOL = Math.cos(0.5 * Math.PI / 180); // 0.5度以内は同一直線とみなす
+
+/** 2点間距離 */
+function _autoTabDist(ax, ay, bx, by) { return Math.hypot(ax - bx, ay - by); }
+
+/**
+ * ポリゴン内包判定（レイキャスト法）。isHoleFlags 判定と同じロジック。
+ */
+function _autoTabPointInPoly(px, py, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const xi = poly[i].x, yi = poly[i].y;
+        const xj = poly[j].x, yj = poly[j].y;
+        const intersect = ((yi > py) !== (yj > py)) &&
+            (px < (xj - xi) * (py - yi) / ((yj - yi) || 1e-10) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+/**
+ * SVGパスのサブパス（M〜Z区切り）を分解する。
+ * getTransformedSegments と違い、変換（オフセット/回転）は適用しない
+ * ＝ .part-outline path の生座標系（手動タブ配置と同じ座標系）のまま扱う。
+ */
+function _autoTabSplitSubpaths(segs) {
+    const subpaths = [];
+    let cur = null;
+    for (const seg of segs) {
+        if (seg.cmd === 'M') { cur = [seg]; subpaths.push(cur); }
+        else if (cur) cur.push(seg);
+    }
+    return subpaths;
+}
+
+/**
+ * サブパスから単純頂点列（BBox・内包判定用）を作る。
+ * 曲線は始点終点のみを使う（安全側・簡易近似で十分）。
+ */
+function _autoTabSubpathVerts(sp) {
+    const verts = [];
+    for (const s of sp) {
+        if (s.cmd === 'M' || s.cmd === 'L' || s.cmd === 'C' || s.cmd === 'A') {
+            verts.push({ x: s.x, y: s.y });
+        }
+    }
+    return verts;
+}
+
+function _autoTabBBox(verts) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const v of verts) {
+        if (v.x < minX) minX = v.x; if (v.x > maxX) maxX = v.x;
+        if (v.y < minY) minY = v.y; if (v.y > maxY) maxY = v.y;
+    }
+    return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY };
+}
+
+function _autoTabCentroid(verts) {
+    let cx = 0, cy = 0;
+    for (const v of verts) { cx += v.x; cy += v.y; }
+    return { x: cx / verts.length, y: cy / verts.length };
+}
+
+/**
+ * 部品内の全サブパスについて「外周」か「内側輪郭（穴）」かを判定する。
+ * Gコード生成側の isHoleFlags と同じ考え方（手がかり0〜3）を、
+ * 生の .part-outline 座標系に対して適用する。
+ * @returns {boolean[]} サブパスごとの isHole フラグ
+ */
+function _autoTabClassifySubpaths(subpaths, partBBox) {
+    const vertsAll = subpaths.map(sp => _autoTabSubpathVerts(sp));
+    const bboxAll = vertsAll.map(vs => vs.length ? _autoTabBBox(vs) : null);
+
+    return subpaths.map((sp, i) => {
+        const vs = vertsAll[i], bb = bboxAll[i];
+        if (!vs || vs.length < 3 || !bb) return false;
+
+        // 手がかり1（最優先・穴確定）: 短辺が板厚程度（20mm未満）
+        if (Math.min(bb.w, bb.h) < AUTO_TAB_SLOT_SHORT_EDGE_LIMIT) return true;
+
+        // 手がかり2（外周確定）: 部品BBoxの全端に接する
+        if (partBBox) {
+            const touchAll =
+                Math.abs(bb.minX - partBBox.minX) < AUTO_TAB_EDGE_MARGIN &&
+                Math.abs(bb.maxX - partBBox.maxX) < AUTO_TAB_EDGE_MARGIN &&
+                Math.abs(bb.minY - partBBox.minY) < AUTO_TAB_EDGE_MARGIN &&
+                Math.abs(bb.maxY - partBBox.maxY) < AUTO_TAB_EDGE_MARGIN;
+            if (touchAll) return false;
+        }
+
+        // 手がかり3: 他のサブパスの内側にある
+        const c = _autoTabCentroid(vs);
+        for (let j = 0; j < subpaths.length; j++) {
+            if (i === j) continue;
+            const vs2 = vertsAll[j];
+            if (!vs2 || vs2.length < 3) continue;
+            const bb2 = bboxAll[j];
+            if (bb2.w * bb2.h < bb.w * bb.h) continue;
+            if (_autoTabPointInPoly(c.x, c.y, vs2)) return true;
+        }
+
+        // 手がかり4: 部品BBox端に接していない
+        if (partBBox) {
+            const touchAny =
+                Math.abs(bb.minX - partBBox.minX) < AUTO_TAB_EDGE_MARGIN ||
+                Math.abs(bb.maxX - partBBox.maxX) < AUTO_TAB_EDGE_MARGIN ||
+                Math.abs(bb.minY - partBBox.minY) < AUTO_TAB_EDGE_MARGIN ||
+                Math.abs(bb.maxY - partBBox.maxY) < AUTO_TAB_EDGE_MARGIN;
+            if (!touchAny) return true;
+        }
+
+        return false;
+    });
+}
+
+/**
+ * サブパスを「直線エッジ」の列に分解する。
+ * 曲線（C/A）は isCurve:true の区切りエッジとして扱い、
+ * 直線グループの連結を断ち切る（曲線区間は自動配置の対象外）。
+ */
+function _autoTabBuildEdges(sp) {
+    const edges = [];
+    let px = 0, py = 0, sx = 0, sy = 0;
+    for (const s of sp) {
+        if (s.cmd === 'M') {
+            px = sx = s.x; py = sy = s.y;
+        } else if (s.cmd === 'L') {
+            const len = _autoTabDist(px, py, s.x, s.y);
+            if (len > 0.01) {
+                edges.push({ x1: px, y1: py, x2: s.x, y2: s.y, len, ux: (s.x - px) / len, uy: (s.y - py) / len, isCurve: false });
+            }
+            px = s.x; py = s.y;
+        } else if (s.cmd === 'C' || s.cmd === 'A') {
+            const len = _autoTabDist(px, py, s.x, s.y);
+            edges.push({ x1: px, y1: py, x2: s.x, y2: s.y, len, ux: 0, uy: 0, isCurve: true });
+            px = s.x; py = s.y;
+        } else if (s.cmd === 'Z') {
+            const len = _autoTabDist(px, py, sx, sy);
+            if (len > 0.01) {
+                edges.push({ x1: px, y1: py, x2: sx, y2: sy, len, ux: (sx - px) / len, uy: (sy - py) / len, isCurve: false });
+            }
+            px = sx; py = sy;
+        }
+    }
+    return edges;
+}
+
+/**
+ * 直線エッジを「同一方向に連続する直線区間（辺）」へグループ化する。
+ * snapTabsToOffsetOutline のグループ化ロジックと同じ考え方。
+ * 曲線エッジは group を断ち切る（対象にしない）。
+ */
+function _autoTabGroupEdges(edges) {
+    const groups = [];
+    let current = null;
+    for (let i = 0; i < edges.length; i++) {
+        const e = edges[i];
+        if (e.isCurve) { current = null; continue; }
+        if (current === null) {
+            current = { edgeIdxs: [i], totalLen: e.len };
+            groups.push(current);
+        } else {
+            const first = edges[current.edgeIdxs[0]];
+            const dot = first.ux * e.ux + first.uy * e.uy;
+            if (dot >= AUTO_TAB_ANGLE_TOL) {
+                current.edgeIdxs.push(i);
+                current.totalLen += e.len;
+            } else {
+                current = { edgeIdxs: [i], totalLen: e.len };
+                groups.push(current);
+            }
+        }
+    }
+    // 閉路の継ぎ目（最後のグループ→最初のグループ）が同方向なら統合する
+    if (groups.length >= 2) {
+        const first = groups[0], last = groups[groups.length - 1];
+        const ef = edges[first.edgeIdxs[0]];
+        const el = edges[last.edgeIdxs[last.edgeIdxs.length - 1]];
+        if (!ef.isCurve && !el.isCurve) {
+            const dot = ef.ux * el.ux + ef.uy * el.uy;
+            if (dot >= AUTO_TAB_ANGLE_TOL) {
+                last.edgeIdxs = last.edgeIdxs.concat(first.edgeIdxs);
+                last.totalLen += first.totalLen;
+                groups.shift();
+            }
+        }
+    }
+    // 弧長→座標変換用に group.startArcByEdge を用意
+    groups.forEach(g => {
+        g.startArcByEdge = new Map();
+        let acc = 0;
+        g.edgeIdxs.forEach(ei => {
+            g.startArcByEdge.set(ei, acc);
+            acc += edges[ei].len;
+        });
+    });
+    return groups;
+}
+
+function _autoTabPointAtGroupArc(edges, group, arc) {
+    const a = Math.max(0, Math.min(group.totalLen, arc));
+    for (const ei of group.edgeIdxs) {
+        const e = edges[ei];
+        const startArc = group.startArcByEdge.get(ei) || 0;
+        if (a <= startArc + e.len + 1e-9) {
+            const t = e.len > 0 ? Math.max(0, Math.min(1, (a - startArc) / e.len)) : 0;
+            return { x: e.x1 + (e.x2 - e.x1) * t, y: e.y1 + (e.y2 - e.y1) * t };
+        }
+    }
+    const e = edges[group.edgeIdxs[group.edgeIdxs.length - 1]];
+    return { x: e.x2, y: e.y2 };
+}
+
+/* ================================================================
+ * タブ自動配置アルゴリズム v2（バランス配置）
+ * ----------------------------------------------------------------
+ * 【v1の問題】
+ *   ・ジョイントの凹凸で分断された直線を1本ずつ「辺」とみなしていたため、
+ *     指1本ごとにタブが付き、結果として片側に偏る／数が過剰になる。
+ *   ・スロット（はめ込み穴）の対向2壁とも中央に置くため、タブが真正面で
+ *     向かい合い、切り抜き片が最後まで残って弾け飛ぶ。
+ *
+ * 【v2の方針】
+ *   ・「同一直線上にある区間」をまとめて1つの壁(wall)とし、さらに部品BBox
+ *     の4辺へ割り当てて、1辺＝1つの論理的な辺として扱う。
+ *   ・辺長 L に対し、基準位置は L の 25% / 75%（端から1/4内側）。
+ *   ・L >= 300mm では 25%〜75% の内側へ等間隔で追加タブを入れる。
+ *   ・理想位置が凹凸の隙間に落ちた場合は、実際に材料のある区間へスナップ。
+ *   ・スロットは対向2壁のタブを辺方向に slotTabOffset だけずらして配置。
+ * ================================================================ */
+
+const AUTO_TAB_LINE_TOL = 0.6;   // 同一直線とみなす垂直距離(mm)
+const AUTO_TAB_AXIS_TOL = 0.02;  // 軸平行判定（方向余弦の許容値）
+const AUTO_TAB_LONG_SIDE = 300;  // この長さ以上の辺は内側に追加タブを入れる(mm)
+
+/** サブパスから直線セグメントのみを取り出す（曲線は対象外） */
+function _autoTabCollectStraightSegs(sp) {
+    return _autoTabBuildEdges(sp).filter(e => !e.isCurve && e.len > 0.05);
+}
+
+/** 1次元区間列をマージする（[{a,b},...] → 重なり／隣接を結合） */
+function _autoTabMergeIntervals(list, tol) {
+    if (!list.length) return [];
+    const s = list.slice().sort((p, q) => p.a - q.a);
+    const out = [{ a: s[0].a, b: s[0].b }];
+    for (let i = 1; i < s.length; i++) {
+        const last = out[out.length - 1];
+        if (s[i].a <= last.b + tol) last.b = Math.max(last.b, s[i].b);
+        else out.push({ a: s[i].a, b: s[i].b });
+    }
+    return out;
+}
+
+/**
+ * 直線セグメントを「同一直線上にある壁(wall)」へまとめる。
+ * ジョイントの凹凸で分断されていても、同じ直線上なら1つの壁になる。
+ * 壁は (方向ベクトル u, 法線 n, 原点からの符号付き距離 offset) で表し、
+ * 各区間は u 方向のスカラー t で保持する（t = P・u）。
+ */
+function _autoTabGroupCollinearWalls(segs, lineTol) {
+    const walls = [];
+    segs.forEach(s => {
+        // 方向を正規化（±180°を同一視 → 逆向きの同一直線も同じ壁になる）
+        let ux = s.ux, uy = s.uy;
+        if (ux < -1e-9 || (Math.abs(ux) <= 1e-9 && uy < 0)) { ux = -ux; uy = -uy; }
+        const nx = -uy, ny = ux;
+        const off = s.x1 * nx + s.y1 * ny;
+        let w = null;
+        for (const W of walls) {
+            if (Math.abs(W.ux * ux + W.uy * uy) < AUTO_TAB_ANGLE_TOL) continue;
+            if (Math.abs(W.offset - off) > lineTol) continue;
+            w = W; break;
+        }
+        if (!w) { w = { ux, uy, nx, ny, offset: off, raw: [], matLen: 0 }; walls.push(w); }
+        const t1 = s.x1 * w.ux + s.y1 * w.uy;
+        const t2 = s.x2 * w.ux + s.y2 * w.uy;
+        w.raw.push({ a: Math.min(t1, t2), b: Math.max(t1, t2) });
+        w.matLen += s.len;
+    });
+    walls.forEach(w => {
+        w.intervals = _autoTabMergeIntervals(w.raw, 0.2);
+        w.spanMin = w.intervals[0].a;
+        w.spanMax = w.intervals[w.intervals.length - 1].b;
+        w.span = w.spanMax - w.spanMin;
+        w.lineX = w.nx * w.offset;   // 縦壁ならこれが x 座標
+        w.lineY = w.ny * w.offset;   // 横壁ならこれが y 座標
+    });
+    return walls;
+}
+
+/**
+ * 壁の中で「タブ中心を置ける」区間を返す。
+ * タブ全長(tabLen)が直線区間からはみ出さず、かつ端から segMargin 以上内側。
+ */
+function _autoTabHostable(w, halfNeed, win) {
+    const out = [];
+    for (const iv of w.intervals) {
+        let lo = iv.a + halfNeed, hi = iv.b - halfNeed;
+        if (win) { lo = Math.max(lo, win.lo); hi = Math.min(hi, win.hi); }
+        if (hi >= lo) out.push({ lo, hi });
+    }
+    return out;
+}
+
+/** 壁上のスカラー位置 t を実座標へ戻す */
+function _autoTabPointOnWall(w, t) {
+    return { x: w.nx * w.offset + w.ux * t, y: w.ny * w.offset + w.uy * t };
+}
+
+/**
+ * 理想位置 tIdeal に最も近い「置ける位置」を選ぶ。
+ * ・材料のある区間（hostable）内のみ
+ * ・すでに置いたタブから minGap 以上離す
+ * ・主線（材料長が最大の直線）以外には linePenalty のコストを課す
+ */
+function _autoTabPickT(lines, tIdeal, linePenalty, usedTs, minGap) {
+    let best = null;
+    for (const ln of lines) {
+        const pen = ln.isPrimary ? 0 : linePenalty;
+        for (const h of ln.hostable) {
+            const span = h.hi - h.lo;
+            const cands = [Math.max(h.lo, Math.min(h.hi, tIdeal))];
+            const steps = Math.min(400, Math.max(1, Math.ceil(span)));
+            for (let k = 0; k <= steps; k++) cands.push(h.lo + span * (k / steps));
+            for (const t of cands) {
+                if (usedTs.some(u => Math.abs(u - t) < minGap)) continue;
+                const cost = Math.abs(t - tIdeal) + pen;
+                if (!best || cost < best.cost) best = { cost, t, line: ln };
+            }
+        }
+    }
+    return best;
+}
+
+/**
+ * 辺長 L に対するタブの理想位置（0〜1の比率）。
+ *   ・短い辺           : 中央1個
+ *   ・L < 300mm        : 25% と 75%
+ *   ・L >= 300mm       : 25% / 75% ＋ その内側に等間隔で追加
+ * primary = 必ず置きたい両端側のタブ、secondary = 内側の追加タブ。
+ */
+function _autoTabIdealFractions(L, spacing, tabLen) {
+    const minTwo = Math.max(80, tabLen * 4);
+    if (L < minTwo) return { primary: [0.5], secondary: [] };
+    const primary = [0.25, 0.75];
+    if (L < AUTO_TAB_LONG_SIDE) return { primary, secondary: [] };
+    // 25%〜75%（＝L/2）の区間を spacing 以下の間隔で分割する
+    const inner = Math.max(1, Math.ceil((0.5 * L) / Math.max(50, spacing)) - 1);
+    const secondary = [];
+    for (let k = 1; k <= inner; k++) secondary.push(0.25 + 0.5 * k / (inner + 1));
+    return { primary, secondary };
+}
+
+/**
+ * 外周輪郭1本ぶんのタブ配置計画。
+ * 部品BBoxの4辺（上下左右）へ壁を割り当て、1辺ごとに 25%/75%(+内側) を配置する。
+ * @returns {{primary: Array<{x,y}>, secondary: Array<{x,y}>}}
+ */
+function _autoTabPlanOuter(sp, partBBox, o) {
+    const segs = _autoTabCollectStraightSegs(sp);
+    if (!segs.length || !partBBox) return { primary: [], secondary: [] };
+    const walls = _autoTabGroupCollinearWalls(segs, AUTO_TAB_LINE_TOL);
+    if (!walls.length) return { primary: [], secondary: [] };
+
+    // BBox端からこの距離以内の平行直線は「その辺の一部」とみなす
+    const bandH = Math.min(o.sideBand, Math.max(3, 0.30 * (partBBox.h || 0)));
+    const bandV = Math.min(o.sideBand, Math.max(3, 0.30 * (partBBox.w || 0)));
+
+    const sides = [
+        { orient: 'h', edgeVal: partBBox.minY, tMin: partBBox.minX, tMax: partBBox.maxX, band: bandH, walls: [] },
+        { orient: 'h', edgeVal: partBBox.maxY, tMin: partBBox.minX, tMax: partBBox.maxX, band: bandH, walls: [] },
+        { orient: 'v', edgeVal: partBBox.minX, tMin: partBBox.minY, tMax: partBBox.maxY, band: bandV, walls: [] },
+        { orient: 'v', edgeVal: partBBox.maxX, tMin: partBBox.minY, tMax: partBBox.maxY, band: bandV, walls: [] },
+    ];
+
+    const leftovers = [];
+    walls.forEach(w => {
+        const isH = Math.abs(w.uy) < AUTO_TAB_AXIS_TOL;
+        const isV = Math.abs(w.ux) < AUTO_TAB_AXIS_TOL;
+        let target = null, bestD = Infinity;
+        if (isH || isV) {
+            const orient = isH ? 'h' : 'v';
+            const coord = isH ? w.lineY : w.lineX;
+            sides.forEach(s => {
+                if (s.orient !== orient) return;
+                const d = Math.abs(coord - s.edgeVal);
+                if (d <= s.band && d < bestD) { bestD = d; target = s; }
+            });
+        }
+        if (target) target.walls.push(w); else leftovers.push(w);
+    });
+
+    // 4辺に属さない長い直線（L字部品・斜め辺など）は独立した辺として扱う
+    leftovers.forEach(w => {
+        if (w.span >= o.minSideLen) {
+            sides.push({ orient: 'free', tMin: w.spanMin, tMax: w.spanMax, band: 0, walls: [w] });
+        }
+    });
+
+    const halfNeed = o.tabLen / 2 + o.segMargin;
+    const perSide = [];
+
+    sides.forEach(side => {
+        if (!side.walls.length) return;
+        // 基準長は BBox ではなく「その辺に実際に材料がある範囲」を使う。
+        // （隣の辺の突起が BBox を広げていても 25%/75% がずれないようにする）
+        side.tMin = Math.min.apply(null, side.walls.map(w => w.spanMin));
+        side.tMax = Math.max.apply(null, side.walls.map(w => w.spanMax));
+        const L = side.tMax - side.tMin;
+        if (L <= 0) return;
+
+        let win = { lo: side.tMin + o.cornerMarginOuter, hi: side.tMax - o.cornerMarginOuter };
+        if (win.hi <= win.lo) win = null;
+
+        let lines = side.walls.map(w => ({ w, hostable: _autoTabHostable(w, halfNeed, win), matLen: w.matLen }));
+        if (!lines.some(l => l.hostable.length)) {
+            // コーナーマージンで全滅した場合はマージンを外して再試行
+            lines = side.walls.map(w => ({ w, hostable: _autoTabHostable(w, halfNeed, null), matLen: w.matLen }));
+        }
+        lines = lines.filter(l => l.hostable.length);
+        if (!lines.length) return;
+
+        // 材料長が最大の直線を「主線」とし、そこを優先してタブを置く
+        const maxMat = Math.max.apply(null, lines.map(l => l.matLen));
+        lines.forEach(l => { l.isPrimary = (l.matLen >= maxMat - 1e-6); });
+
+        const ideal = _autoTabIdealFractions(L, o.spacing, o.tabLen);
+        const usedTs = [];
+        const primary = [], secondary = [];
+        const put = (f, arr) => {
+            const tIdeal = side.tMin + L * f;
+            const pick = _autoTabPickT(lines, tIdeal, o.linePenalty, usedTs, o.minTabGap);
+            if (!pick) return;
+            usedTs.push(pick.t);
+            arr.push(_autoTabPointOnWall(pick.line.w, pick.t));
+        };
+        ideal.primary.forEach(f => put(f, primary));
+        ideal.secondary.forEach(f => put(f, secondary));
+        if (primary.length || secondary.length) perSide.push({ primary, secondary });
+    });
+
+    const primary = [];
+    perSide.forEach(s => { primary.push.apply(primary, s.primary); });
+
+    // 追加タブは辺をまたいでラウンドロビンで取り出す（上限で間引かれても偏らない）
+    const secondary = [];
+    for (let idx = 0; ; idx++) {
+        let found = false;
+        perSide.forEach(s => { if (s.secondary[idx]) { secondary.push(s.secondary[idx]); found = true; } });
+        if (!found) break;
+    }
+    return { primary, secondary };
+}
+
+/**
+ * 内側輪郭（はめ込みスロット／穴）1つぶんのタブ配置計画。
+ * 対向する2壁を選び、辺方向へ slotTabOffset だけずらして配置することで、
+ * タブが真正面で向かい合って切り抜き片が弾け飛ぶのを防ぐ。
+ * @returns {Array<{x,y}>}
+ */
+function _autoTabPlanSlot(sp, o) {
+    const segs = _autoTabCollectStraightSegs(sp);
+    if (!segs.length) return [];
+    const walls = _autoTabGroupCollinearWalls(segs, AUTO_TAB_LINE_TOL);
+    const halfNeed = o.tabLen / 2 + o.slotSegMargin;
+    walls.forEach(w => { w.hostable = _autoTabHostable(w, halfNeed, null); });
+
+    const valid = walls.filter(w => w.hostable.length > 0);
+    if (!valid.length) return [];
+    valid.sort((a, b) => b.matLen - a.matLen);
+
+    const A = valid[0];
+    const rangeOf = w => ({ lo: w.hostable[0].lo, hi: w.hostable[w.hostable.length - 1].hi });
+    const snap = (w, t) => {
+        let best = null;
+        w.hostable.forEach(h => {
+            const c = Math.max(h.lo, Math.min(h.hi, t));
+            const d = Math.abs(c - t);
+            if (!best || d < best.d) best = { d, t: c };
+        });
+        return best ? best.t : t;
+    };
+
+    let B = null;
+    if (o.preferOppositeWalls && o.maxTabsPerSlot >= 2) {
+        B = valid.slice(1).find(w =>
+            Math.abs(w.ux * A.ux + w.uy * A.uy) >= AUTO_TAB_ANGLE_TOL &&
+            Math.abs(w.offset - A.offset) > 0.5
+        ) || null;
+    }
+
+    const ra = rangeOf(A);
+    if (!B) return [_autoTabPointOnWall(A, snap(A, (ra.lo + ra.hi) / 2))];
+
+    const rb = rangeOf(B);
+    const lo = Math.max(ra.lo, rb.lo), hi = Math.min(ra.hi, rb.hi);
+    let tA, tB;
+    if (hi > lo) {
+        const mid = (lo + hi) / 2;
+        const sep = Math.min(o.slotTabOffset, hi - lo);
+        tA = mid - sep / 2;
+        tB = mid + sep / 2;
+    } else {
+        tA = (ra.lo + ra.hi) / 2 - o.slotTabOffset / 2;
+        tB = (rb.lo + rb.hi) / 2 + o.slotTabOffset / 2;
+    }
+    tA = snap(A, tA);
+    tB = snap(B, tB);
+
+    // ずらしきれず正面で向かい合うなら、片側1個だけにする（弾け防止を優先）
+    if (Math.abs(tA - tB) < o.tabLen * 0.9) {
+        return [_autoTabPointOnWall(A, snap(A, (ra.lo + ra.hi) / 2))];
+    }
+    return [_autoTabPointOnWall(A, tA), _autoTabPointOnWall(B, tB)];
+}
+
+/**
+ * 1部品分のタブ自動配置。
+ * @param {Element} partEl  g[data-x][id^="part-"] 要素
+ * @param {Object} options  autoPlaceTabs() が組み立てる設定オブジェクト
+ * @returns {Object} {outerCount, slotCount, skipped: boolean}
+ */
+function autoPlaceTabsForPart(partEl, options) {
+    const rotGroup = partEl.querySelector('.rot-group');
+    if (!rotGroup) return { outerCount: 0, slotCount: 0, skipped: true };
+
+    let pathEls = rotGroup.querySelectorAll('.part-outline path');
+    if (pathEls.length === 0) pathEls = rotGroup.querySelectorAll('path');
+    if (pathEls.length === 0) return { outerCount: 0, slotCount: 0, skipped: true };
+
+    // 全パス・全サブパスを収集（複数<path>要素にまたがる場合に対応）
+    const allSubpaths = [];
+    pathEls.forEach(pe => {
+        const d = pe.getAttribute('d') || '';
+        if (!d.trim()) return;
+        const segs = parseSvgPathToSegments(d);
+        _autoTabSplitSubpaths(segs).forEach(sp => allSubpaths.push(sp));
+    });
+    if (allSubpaths.length === 0) return { outerCount: 0, slotCount: 0, skipped: true };
+
+    // 部品全体のBBox（外周/穴判定・辺割り当て用）
+    let partBBox = null;
+    {
+        const allVerts = [];
+        allSubpaths.forEach(sp => allVerts.push(..._autoTabSubpathVerts(sp)));
+        if (allVerts.length > 0) partBBox = _autoTabBBox(allVerts);
+    }
+
+    const isHole = _autoTabClassifySubpaths(allSubpaths, partBBox);
+
+    // 既存タブ（手動 or 既に配置済み）の位置を集めて重複回避に使う
+    const placedPositions = [];
+    rotGroup.querySelectorAll('.tab-marker').forEach(m => {
+        placedPositions.push({
+            x: parseFloat(m.getAttribute('data-tx') || '0'),
+            y: parseFloat(m.getAttribute('data-ty') || '0')
+        });
+    });
+
+    function tooCloseToExisting(x, y) {
+        return placedPositions.some(p => _autoTabDist(p.x, p.y, x, y) < options.manualAvoidDist);
+    }
+
+    function placeIfFree(x, y) {
+        if (tooCloseToExisting(x, y)) return false;
+        drawTabMarker(rotGroup, x, y);
+        placedPositions.push({ x, y });
+        return true;
+    }
+
+    let outerCount = 0, slotCount = 0;
+
+    // ---- 外周輪郭の処理（辺の25%/75%基準＋長辺は内側に追加）----
+    allSubpaths.forEach((sp, spIdx) => {
+        if (isHole[spIdx]) return;
+        const plan = _autoTabPlanOuter(sp, partBBox, options);
+        // 上限は「両端側(primary)を優先し、余った枠に内側(secondary)を入れる」
+        const pts = plan.primary.slice(0, options.maxTabsPerPart);
+        for (const p of plan.secondary) {
+            if (pts.length >= options.maxTabsPerPart) break;
+            pts.push(p);
+        }
+        pts.forEach(pt => { if (placeIfFree(pt.x, pt.y)) outerCount++; });
+    });
+
+    // ---- 内側輪郭（ジョイントスロット等）の処理 ----
+    if (options.includeSlots) {
+        allSubpaths.forEach((sp, spIdx) => {
+            if (!isHole[spIdx]) return;
+            const pts = _autoTabPlanSlot(sp, options);
+            if (!pts.length) return;
+            // 同一スロット内の対向壁同士はスロット幅ぶんしか離れていないため、
+            // 相互の重複回避チェックは行わず、既存の他タブに対してのみ判定する。
+            const accepted = pts.filter(pt => !tooCloseToExisting(pt.x, pt.y));
+            accepted.forEach(pt => {
+                drawTabMarker(rotGroup, pt.x, pt.y);
+                placedPositions.push({ x: pt.x, y: pt.y });
+                slotCount++;
+            });
+        });
+    }
+
+    return { outerCount, slotCount, skipped: (outerCount === 0 && slotCount === 0) };
+}
+
+/**
+ * 全ボード・全部品に対するタブ一括自動配置のエントリポイント。
+ * ジョイント生成ボタンと同じ体裁で、実行後に結果をアラート表示する。
+ */
+function autoPlaceTabs() {
+    const svg = document.querySelector('#svg-container svg');
+    if (!svg) { alert('SVGが見つかりません。先にSTLを読み込んでください。'); return; }
+
+    const allParts = Array.from(svg.querySelectorAll('g[data-x][id^="part-"]'));
+    if (allParts.length === 0) { alert('部品が見つかりません。'); return; }
+
+    const millSel  = document.getElementById('tool-diameter');
+    const millDiam = millSel ? (parseFloat(millSel.value) || 6) : 6;
+    const tabLen   = millDiam <= 6 ? 16 : 20; // Gコード生成側と同じ TAB_LEN 基準
+
+    const spacing = parseFloat(document.getElementById('tab-spacing-input')?.value) || 150;
+    const cornerMarginOuter = parseFloat(document.getElementById('tab-margin-input')?.value) || 15;
+    const cornerMarginSlot = Math.min(cornerMarginOuter, 5); // 要件4.4: スロットは既定5mm
+    const maxTabsPerPart = parseInt(document.getElementById('tab-max-per-part-input')?.value, 10) || 8;
+    const includeSlots = !!document.getElementById('tab-include-slots-checkbox')?.checked;
+    const preferOppositeWalls = !!document.getElementById('tab-opposite-walls-checkbox')?.checked;
+    const keepExisting = !!document.getElementById('tab-keep-existing-checkbox')?.checked;
+
+    if (!keepExisting) clearAllTabMarkers();
+
+    const options = {
+        spacing,
+        cornerMarginOuter,
+        cornerMarginSlot,
+        maxTabsPerPart,
+        includeSlots,
+        preferOppositeWalls,
+        maxTabsPerSlot: 2,
+        tabLen,
+        manualAvoidDist: 20,
+
+        // --- v2 バランス配置用パラメータ ---
+        segMargin:     Math.max(3, tabLen * 0.25), // 直線区間の端からの最小逃げ(mm)
+        sideBand:      Math.max(25, tabLen * 1.5), // BBox端からこの距離内の平行直線は同じ辺とみなす
+        minSideLen:    Math.max(60, tabLen * 3.5), // 独立した辺として扱う最小長／25%-75%配置の最小長
+        minTabGap:     tabLen * 1.5,               // 同一辺内でタブ同士を離す最小距離
+        linePenalty:   8,                          // 主線以外へ置くときのコスト(mm相当)
+        slotSegMargin: Math.min(cornerMarginSlot, 4), // スロット壁の端からの逃げ(mm)
+        slotTabOffset: tabLen * 1.5,               // スロット対向2壁のタブをずらす量(mm)
+    };
+
+    let totalOuter = 0, totalSlot = 0, skippedParts = 0;
+    allParts.forEach(partEl => {
+        const result = autoPlaceTabsForPart(partEl, options);
+        totalOuter += result.outerCount;
+        totalSlot  += result.slotCount;
+        if (result.skipped) skippedParts++;
+    });
+
+    const totalTabs = totalOuter + totalSlot;
+    let msg = `${allParts.length}部品に対して合計 ${totalTabs} 個のタブを自動配置しました`;
+    msg += `（外周${totalOuter}個`;
+    if (includeSlots) msg += `／ジョイントスロット${totalSlot}個`;
+    msg += `）。`;
+    if (skippedParts > 0) {
+        msg += `\nうち ${skippedParts} 部品は輪郭が短すぎるためタブなしで配置しました。`;
+    }
+    alert(msg);
+}
+
 // STL再読み込み時のタブリセット
 const _origDisplayAsSvg = displayAsSvg;
 window.displayAsSvg = function(geos) {
@@ -4273,6 +5058,9 @@ window.displayAsSvg = function(geos) {
 // ================================================================
 const tabButton = document.getElementById('tab-button');
 if (tabButton) tabButton.addEventListener('click', (e) => { e.preventDefault(); toggleTabMode(); });
+
+const autoTabButton = document.getElementById('auto-tab-button');
+if (autoTabButton) autoTabButton.addEventListener('click', (e) => { e.preventDefault(); autoPlaceTabs(); });
 
 const gcodeButton = document.getElementById('gcode-button');
 if (gcodeButton) gcodeButton.addEventListener('click', (e) => { e.preventDefault(); generateAndDownloadGcode(); });
