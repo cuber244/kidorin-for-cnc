@@ -507,13 +507,13 @@ function runEvaluation(){
   add(finalTabDepth!==null?'rpt-ok':'rpt-warn','実タブ判定深さ',finalTabDepth!==null?`TAB DOWN後の最深戻りZ ${fmtMM(finalTabDepth,3)}`:'—');
   add(detectedPass1Z!==null&&detectedFinalZ!==null?'rpt-ok':'rpt-warn','周回深さ',(detectedPass1Z!==null&&detectedFinalZ!==null&&Math.abs(detectedPass1Z-detectedFinalZ)<0.05)?`単周 Z${fmtMM(detectedFinalZ,3)}`:`浅い周回 Z${fmtMM(detectedPass1Z,3)} / 最終周回 Z${fmtMM(detectedFinalZ,3)}`);
   add(detectedTabZ!==null?'rpt-ok':'rpt-warn','タブZ値',detectedTabZ!==null?`Z${fmtMM(detectedTabZ,3)}`:'検出なし');
-  add(tabH!==null&&Math.abs(tabH-6)<0.5?'rpt-ok':'rpt-warn','タブ高さ',tabH!==null?`${tabH.toFixed(1)}mm ${Math.abs(tabH-6)<0.5?'✅':'⚠️'}`:'—');
+  add(tabH!==null&&tabH>0.5&&tabH<matZ?'rpt-ok':'rpt-warn','タブ高さ',tabH!==null?`${tabH.toFixed(1)}mm ${(tabH>0.5&&tabH<matZ)?'✅':'⚠️'}`:'—');
   if(tabLens.length){add(tabNG.length===0?'rpt-ok':'rpt-warn','タブ幅',`平均 ${avg.toFixed(1)}mm / 基準${expectedTabWidth.toFixed(0)}±2mm: ${tabOK.length}/${tabLens.length} / 異常: ${tabNG.length}`);}
   add(zMoveCount===finalTabSegments.length*2?'rpt-ok':'rpt-warn','タブZ移動描画',`最終周回のTAB UP/DOWNに伴うZ移動 ${zMoveCount}本を黄色表示`);
   add(detectedToolDiameter!==null?'rpt-ok':'rpt-warn','エンドミル直径',detectedToolDiameter!==null?`${fmtMM(detectedToolDiameter)}mm`:'検出なし');
   add(detectedGcodeFormat?'rpt-ok':'rpt-warn','G-code Format',`${detectedGcodeFormat}${detectedGcodeFormatDetail?' / '+detectedGcodeFormatDetail:''}`);
   add('rpt-ok','Z表示方向','通常切削はZマイナス方向を画面下側へ投影（深い周回は浅い周回より下）');
-  add('rpt-ok','TAB高さ表示','黄色TABも通常切削と同じZ投影を使用（拡大補正なし、6.0mmを実寸反映）');
+  add('rpt-ok','TAB高さ表示','黄色TABも通常切削と同じZ投影を使用（拡大補正なし、実タブ厚さを実寸反映）');
   add('rpt-ok','重ね描画順','深いZを先に描画し、浅い周回を後から描画（深い周回が上塗りされない）');
   if(xMin<Infinity){const oob=xMin<-1||yMin<-1||xMax>matW+1||yMax>matH+1;add('','切削範囲 X',`${xMin.toFixed(1)} ～ ${xMax.toFixed(1)}mm`);add('','切削範囲 Y',`${yMin.toFixed(1)} ～ ${yMax.toFixed(1)}mm`);add(oob?'rpt-ng':'rpt-ok','材料範囲内',oob?'❌ はみ出しあり':'✅ 全座標が材料内');}
   add(hasM30?'rpt-ok':'rpt-ng','M30（終了命令）',hasM30?'✅ あり':'❌ なし');

@@ -1797,6 +1797,11 @@ function displayAsSvg(geometries) {
             loops.push(loop);
         }
 
+        // 加工順を「内側の穴・はめ込み形状 → 外側の輪郭」にするため、
+        // 面積が小さいループ（内側の穴）から先に並べ、最大面積（外形）を最後にする。
+        // こうすることで、部品が材料から切り離される前に内側の加工を終えられる。
+        loops.sort((a, b) => Math.abs(polygonArea(a)) - Math.abs(polygonArea(b)));
+
         let fullPathD = "";
         loops.forEach(loop => {
             const simplified = simplifyLoop(loop);
@@ -2891,9 +2896,9 @@ function segmentsToGcodeLines(segments, svgH, feedRate, plungeRate, clearH, pass
     const expandTabs = (lines, currentCutZ, plungeR, isFinalPass) => {
         const tabZval = TAB_HEIGHT_Z;
         // currentCutZ は負値。タブ上面(tabZval)が現在パスより浅い場合だけZを上げる。
-        // 例: 材料13.5mm・タブ残し6mm → tabZ=-7.5。
-        // 1パス目Z=-7.6ではタブ区間だけZ=-7.5へ上げる、
-        // 2パス目Z=-13.5でもタブ区間だけZ=-7.5へ上げて切り残す。
+        // 例: 材料13.5mm・タブ残し8mm → tabZ=-5.5。
+        // 1パス目Z=-7.6ではタブ区間だけZ=-5.5へ上げる、
+        // 2パス目Z=-13.5でもタブ区間だけZ=-5.5へ上げて切り残す。
         const tabNeedsLift = tabZval > currentCutZ + 0.001;
         for (const gl of lines) {
             if (gl.startsWith('__TAB_UP__')) {
@@ -4054,7 +4059,8 @@ function generateAndDownloadGcode() {
 
     // ---- ミル径に応じたタブサイズ ----
     const TAB_LEN = millDiam <= 6 ? 16 : 20;
-    const TAB_H   = 6.0;  // タブ残し高さ 6mm
+
+    const TAB_H   = parseFloat(document.getElementById('tab-height-input')?.value) || 8.0;  // タブ残し高さ（設定パネルの入力欄、既定 8mm）
     TAB_HEIGHT_Z  = -(matThick - TAB_H);
 
     // 板ごとに部品をグループ分け
