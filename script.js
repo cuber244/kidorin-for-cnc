@@ -4159,6 +4159,33 @@ function createMachiningTabGeometry(tab, toolDiameter, tabHeight, materialThickn
     return geo;
 }
 
+function applyMachiningBoardUVs(geometry, boardLength, boardWidth, materialThickness) {
+    if(!geometry)return geometry;
+    const pos=geometry.getAttribute('position');
+    if(!pos)return geometry;
+    if(!geometry.getAttribute('normal'))geometry.computeVertexNormals();
+    const normal=geometry.getAttribute('normal'),uv=new Float32Array(pos.count*2);
+    const length=Math.max(1e-6,boardLength),width=Math.max(1e-6,boardWidth),thickness=Math.max(1e-6,materialThickness);
+    for(let i=0;i<pos.count;i++){
+        const x=pos.getX(i),y=pos.getY(i),z=pos.getZ(i);
+        const ax=Math.abs(normal.getX(i)),ay=Math.abs(normal.getY(i)),az=Math.abs(normal.getZ(i));
+        let u,v;
+        if(ay>=ax && ay>=az){
+            // 天面・底面: 板の長手Xを木目(U)、板幅ZをVにする。
+            u=x/length;v=z/width;
+        }else if(az>=ax){
+            // 長辺側面: 木目は天面と同じX方向、Vは板厚方向。
+            u=x/length;v=(-y)/thickness;
+        }else{
+            // 木口面: 板幅方向と板厚方向で展開する。
+            u=z/width;v=(-y)/thickness;
+        }
+        uv[i*2]=u;uv[i*2+1]=v;
+    }
+    geometry.setAttribute('uv',new THREE.BufferAttribute(uv,2));
+    return geometry;
+}
+
 function machiningColorForPart(partEl, fallbackIndex) {
     const raw = partEl?.dataset?.partColor || '';
     if (/^#[0-9a-f]{6}$/i.test(raw)) return raw;
@@ -4405,6 +4432,7 @@ function generateAndDownloadGcode() {
                 const partNo = sortedPartIndex + 1;
                 const partId = partEl.id || `part-${partNo}`;
                 const partGeometry = createMachiningExtrusionFromLoops(designLoops, matThick);
+                applyMachiningBoardUVs(partGeometry,bLength,bWidth,matThick);
                 if (partGeometry) machinedParts.push({
                     geometry:partGeometry,
                     name:`Part_${String(partNo).padStart(3,'0')}`,
@@ -4426,6 +4454,7 @@ function generateAndDownloadGcode() {
                 allExportTabs.forEach((tab, tabIndex) => {
                     const tabGeometry=createMachiningTabGeometry(tab,millDiam,TAB_H,matThick);
                     if (!tabGeometry) return;
+                    applyMachiningBoardUVs(tabGeometry,bLength,bWidth,matThick);
                     const tabName=`${String(partNo).padStart(3,'0')}_${String(tabIndex+1).padStart(2,'0')}`;
                     machinedTabs.push({
                         geometry:tabGeometry,
@@ -4468,6 +4497,7 @@ function generateAndDownloadGcode() {
 
         const stockOuter=[{x:0,y:0},{x:bLength,y:0},{x:bLength,y:bWidth},{x:0,y:bWidth}];
         const stockGeometry=createMachiningExtrusionFromLoops([stockOuter].concat(unionMachiningLoops(stockHoles)),matThick);
+        applyMachiningBoardUVs(stockGeometry,bLength,bWidth,matThick);
         machinedBoards.push({
             boardIndex:boardIdx,
             name:`Board_${String(boardIdx+1).padStart(2,'0')}`,
@@ -4549,6 +4579,12 @@ function buildMachinedGlb(model) {
             for(let i=0;i<norm.count;i++)arr.set([norm.getX(i),norm.getY(i),norm.getZ(i)],i*3);
             attributes.NORMAL=addAccessor(arr,'VEC3',norm.count,34962);
         }
+        const uv=geo.getAttribute('uv');
+        if(uv){
+            const arr=new Float32Array(uv.count*2);
+            for(let i=0;i<uv.count;i++)arr.set([uv.getX(i),uv.getY(i)],i*2);
+            attributes.TEXCOORD_0=addAccessor(arr,'VEC2',uv.count,34962);
+        }
         const prim={attributes};
         if(geo.index){
             const use32=pos.count>65535||geo.index.count>65535;
@@ -4579,7 +4615,7 @@ function buildMachinedGlb(model) {
         nodes.push({name:board.name,children:roleGroups,translation:[board.xOffset || 0,0,0],extras:{role:'board',boardIndex:board.boardIndex,units:'millimeters'}});
         boardNodeIndices.push(nodes.length-1);
     });
-    nodes.push({name:'CNC_Result',children:boardNodeIndices,scale:[.001,.001,.001],extras:{units:'millimeters',sourceFile:model.sourceFile || '',toolDiameter:model.toolDiameter,materialThickness:model.materialThickness}});
+    nodes.push({name:'CNC_Result',children:boardNodeIndices,scale:[.001,.001,.001],extras:{units:'millimeters',sourceFile:model.sourceFile || '',toolDiameter:model.toolDiameter,materialThickness:model.materialThickness,uvMapping:'board-planar',grainAxis:'board-x'}});
     const rootIndex=nodes.length-1;
     const gltf={asset:{version:'2.0',generator:'Kidorin for CNC'},scene:0,scenes:[{name:'CNC_Result',nodes:[rootIndex]}],nodes,meshes:meshDefs,materials:materialDefs,accessors,bufferViews,buffers:[{byteLength:byteOffset}]};
     let jsonBytes=new TextEncoder().encode(JSON.stringify(gltf));
