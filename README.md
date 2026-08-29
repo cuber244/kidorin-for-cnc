@@ -198,6 +198,7 @@ kidorin.png       アプリアイコン（任意）
 - **外部ライブラリ**（CDN読込）
   - [Three.js](https://threejs.org/) r128 — 3Dレンダリング・STL読込
   - [Interact.js](https://interactjs.io/) — 部品のドラッグ操作
+  - [clipper-lib](https://github.com/junmer/clipper-lib) 6.4.2 — 加工後GLBの工具径オフセットと重複輪郭の統合
 
 ---
 

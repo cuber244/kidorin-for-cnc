@@ -4033,23 +4033,6 @@ function machiningSegmentsToLoops(segs, tolerance) {
     return loops;
 }
 
-function machiningLoopSelfIntersects(loop) {
-    const orient=(a,b,c)=>(b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
-    const crosses=(a,b,c,d)=>{
-        const ab1=orient(a,b,c),ab2=orient(a,b,d),cd1=orient(c,d,a),cd2=orient(c,d,b);
-        return ((ab1>1e-7&&ab2<-1e-7)||(ab1<-1e-7&&ab2>1e-7)) && ((cd1>1e-7&&cd2<-1e-7)||(cd1<-1e-7&&cd2>1e-7));
-    };
-    for(let i=0;i<loop.length;i++){
-        const i2=(i+1)%loop.length;
-        for(let j=i+1;j<loop.length;j++){
-            const j2=(j+1)%loop.length;
-            if(i===j||i2===j||j2===i)continue;
-            if(crosses(loop[i],loop[i2],loop[j],loop[j2]))return true;
-        }
-    }
-    return false;
-}
-
 function machiningLoopArea(loop) {
     let area = 0;
     for (let i=0; i<loop.length; i++) {
@@ -4071,6 +4054,38 @@ function machiningPointInLoop(point, loop) {
         if(((a.y>point.y)!==(b.y>point.y)) && point.x < (b.x-a.x)*(point.y-a.y)/((b.y-a.y)||1e-12)+a.x) inside=!inside;
     }
     return inside;
+}
+
+function machiningClipperPaths(loops, scale) {
+    return (loops || []).filter(loop=>loop?.length>=3).map(loop=>{
+        const path=loop.map(p=>({X:Math.round(p.x*scale),Y:Math.round(p.y*scale)}));
+        if(!ClipperLib.Clipper.Orientation(path))path.reverse();
+        return path;
+    });
+}
+
+function machiningLoopsFromClipper(paths, scale) {
+    return (paths || []).map(path=>path.map(p=>({x:p.X/scale,y:p.Y/scale}))).filter(loop=>loop.length>=3);
+}
+
+function offsetMachiningOuterLoops(loops, distance) {
+    if(typeof ClipperLib==='undefined')throw new Error('切削幅の生成ライブラリを読み込めませんでした。ネットワーク接続を確認して再読み込みしてください。');
+    const scale=1000,paths=machiningClipperPaths(loops,scale),solution=new ClipperLib.Paths();
+    if(!paths.length)return [];
+    const offsetter=new ClipperLib.ClipperOffset(4,Math.max(1,.1*scale));
+    offsetter.AddPaths(paths,ClipperLib.JoinType.jtRound,ClipperLib.EndType.etClosedPolygon);
+    offsetter.Execute(solution,distance*scale);
+    return machiningLoopsFromClipper(solution,scale);
+}
+
+function unionMachiningLoops(loops) {
+    if(typeof ClipperLib==='undefined')return loops || [];
+    const scale=1000,paths=machiningClipperPaths(loops,scale),solution=new ClipperLib.Paths();
+    if(!paths.length)return [];
+    const clipper=new ClipperLib.Clipper();
+    clipper.AddPaths(paths,ClipperLib.PolyType.ptSubject,true);
+    clipper.Execute(ClipperLib.ClipType.ctUnion,solution,ClipperLib.PolyFillType.pftNonZero,ClipperLib.PolyFillType.pftNonZero);
+    return machiningLoopsFromClipper(solution,scale);
 }
 
 function machiningClassifyLoops(loops) {
@@ -4384,7 +4399,7 @@ function generateAndDownloadGcode() {
             // Gコードと同じ配置済み輪郭から、部品・残材・タブの独立メッシュを作る。
             const designLoopsByContour=machiningContours.map(c=>machiningSegmentsToLoops(c.segs));
             const designLoops=designLoopsByContour.flat();
-            const designLoopLevels=new Map(machiningClassifyLoops(designLoops).map(info=>[info.loop,info.level]));
+            const classifiedDesignLoops=machiningClassifyLoops(designLoops);
             const outer = machiningLargestLoop(designLoops);
             if (outer) {
                 const partNo = sortedPartIndex + 1;
@@ -4400,33 +4415,13 @@ function generateAndDownloadGcode() {
                 // Stockから除去するのは各部品の最外周だけ。内側の穴・スロットまで
                 // Stock輪郭へ渡すと、包含の偶奇判定で「廃材島」が全厚ソリッドとして
                 // 復活し、ドリル切削部を塞いでしまう。内側加工は空間のまま残す。
-                // 残材境界は設計輪郭から工具直径ぶんを一度だけオフセットする。
-                // 「工具半径オフセット済み中心線」を再オフセットすると、凹角の
-                // miter/逃げ加工点が自己交差し、Stock上面に長い三角スパイクが出る。
-                // 設計輪郭からの単一計算なら、工具中心までの半径＋工具外周までの
-                // 半径（合計=工具直径）を同時に表せる。
-                machiningContours.forEach((contour,contourIndex) => {
-                    const stockSideLoops=machiningSegmentsToLoops(applyToolRadiusOffset(contour.segs,millDiam,partBBox));
-                    const centerLoops=machiningSegmentsToLoops(contour.offsetSegs);
-                    const designBoundaryLoops=designLoopsByContour[contourIndex] || [];
-                    stockSideLoops.forEach((loop,loopIndex)=>{
-                        const designLoop=designBoundaryLoops[loopIndex];
-                        if(!designLoop || designLoopLevels.get(designLoop)!==0)return;
-                        if(!machiningLoopSelfIntersects(loop))stockHoles.push(loop);
-                        else{
-                            const fallback=centerLoops[loopIndex];
-                            if(fallback && !machiningLoopSelfIntersects(fallback)){
-                                console.warn('残材境界の自己交差を検出したため工具中心輪郭へフォールバックしました。',partId,loopIndex);
-                                stockHoles.push(fallback);
-                            }else{
-                                const designFallback=designBoundaryLoops[loopIndex];
-                                if(!designFallback || machiningLoopSelfIntersects(designFallback))throw new Error(`残材境界を生成できませんでした: ${partId} / contour ${loopIndex+1}`);
-                                console.warn('オフセット輪郭が自己交差したため、安定性を優先して設計輪郭へフォールバックしました。',partId,loopIndex);
-                                stockHoles.push(designFallback);
-                            }
-                        }
-                    });
-                });
+                // 工具中心は部品外周から半径ぶん外側、残材境界はそこからさらに
+                // 半径ぶん外側なので、設計外周を工具直径ぶん拡張すると実際の溝幅になる。
+                // ClipperOffsetで凹角の自己交差を解消し、設計輪郭へのゼロ幅fallbackを避ける。
+                const outerDesignLoops=classifiedDesignLoops.filter(info=>info.level===0).map(info=>info.loop);
+                const stockSideLoops=offsetMachiningOuterLoops(outerDesignLoops,millDiam);
+                if(!stockSideLoops.length)throw new Error(`残材境界を生成できませんでした: ${partId}`);
+                stockHoles.push(...stockSideLoops);
                 const allExportTabs=machiningContours.flatMap(contour=>contour.offsetTabs || []);
                 allExportTabs.forEach((tab, tabIndex) => {
                     const tabGeometry=createMachiningTabGeometry(tab,millDiam,TAB_H,matThick);
@@ -4472,7 +4467,7 @@ function generateAndDownloadGcode() {
         });
 
         const stockOuter=[{x:0,y:0},{x:bLength,y:0},{x:bLength,y:bWidth},{x:0,y:bWidth}];
-        const stockGeometry=createMachiningExtrusionFromLoops([stockOuter].concat(stockHoles),matThick);
+        const stockGeometry=createMachiningExtrusionFromLoops([stockOuter].concat(unionMachiningLoops(stockHoles)),matThick);
         machinedBoards.push({
             boardIndex:boardIdx,
             name:`Board_${String(boardIdx+1).padStart(2,'0')}`,
