@@ -423,16 +423,17 @@ function syncJointViewer() {
     #toolbar { display: none; }
   }
 
-  #close-btn, #reset-btn, #dim-btn, #stl-export-btn, #glb-export-btn, #view-mode-btn, #joint-edit-btn {
+  #close-btn, #reset-btn, #dim-btn, #stl-export-btn, #glb-export-btn, #machined-glb-export-btn, #view-mode-btn, #joint-edit-btn {
     position:absolute;top:10px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.1);
     color:#fff;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:11px;transition:background 0.2s;
     z-index: 20;
   }
   #close-btn{right:14px;} #reset-btn{right:78px;}
-  #close-btn:hover, #reset-btn:hover, #dim-btn:hover, #stl-export-btn:hover, #glb-export-btn:hover, #view-mode-btn:hover, #joint-edit-btn:hover {background:rgba(255,255,255,0.3);}
+  #close-btn:hover, #reset-btn:hover, #dim-btn:hover, #stl-export-btn:hover, #glb-export-btn:hover, #machined-glb-export-btn:hover, #view-mode-btn:hover, #joint-edit-btn:hover {background:rgba(255,255,255,0.3);}
   #dim-btn{right:152px;} #dim-btn.active{background:rgba(255,255,255,0.35);font-weight:700;}
   #stl-export-btn{right:240px;background:rgba(40,167,69,0.5);border-color:rgba(40,167,69,0.3);}
   #glb-export-btn{right:350px;background:rgba(111,66,193,0.5);border-color:rgba(111,66,193,0.3);}
+  #machined-glb-export-btn{right:460px;background:rgba(0,123,167,.62);border-color:rgba(90,205,235,.45);}
   #joint-edit-btn{right:14px;top:44px;background:rgba(40,167,69,.62);border-color:rgba(100,220,130,.45);min-width:116px;}
   #joint-edit-btn.active{background:rgba(220,53,69,.72);border-color:rgba(255,120,130,.6);}
   #view-mode-btn{right:14px;top:78px;background:rgba(0,123,255,.55);border-color:rgba(80,170,255,.45);min-width:116px;display:none;}
@@ -465,6 +466,7 @@ function syncJointViewer() {
 <button id="dim-btn" onclick="toggleDimensions()">寸法表示</button>
 <button id="stl-export-btn" onclick="exportSTL()">STLエクスポート</button>
 <button id="glb-export-btn" onclick="exportGLB()">GLBエクスポート</button>
+<button id="machined-glb-export-btn" onclick="exportMachinedGLB()">加工後GLB</button>
 <button id="joint-edit-btn" onclick="toggleJointEditMode()">交差部編集</button>
 <button id="view-mode-btn" onclick="toggleMaterialViewMode()">表示：不透過</button>
 <button id="close-btn" onclick="window.close()">閉じる</button>
@@ -477,6 +479,13 @@ function syncJointViewer() {
 const COLORS = ${JSON.stringify(colors)};
 let parentGeosData = ${geometriesJson};
 let parentJointData = ${jointsJson};
+
+function exportMachinedGLB(){
+  if(!window.opener || window.opener.closed || typeof window.opener.kidorinExportMachinedGLB!=='function'){
+    alert('親画面で加工後GLBを生成できません。');return;
+  }
+  window.opener.kidorinExportMachinedGLB();
+}
 
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
@@ -3930,11 +3939,11 @@ function snapTabsToOffsetOutline(tabSegments, segs) {
             const startArc = group.startArcByEdge.get(ei) || 0;
             if (a <= startArc + e.len + 1e-9) {
                 const t = Math.max(0, Math.min(1, (a - startArc) / e.len));
-                return { cx: e.x1 + (e.x2-e.x1)*t, cy: e.y1 + (e.y2-e.y1)*t };
+                return { cx: e.x1 + (e.x2-e.x1)*t, cy: e.y1 + (e.y2-e.y1)*t, ux:e.ux, uy:e.uy };
             }
         }
         const e = edges[group.edgeIdxs[group.edgeIdxs.length - 1]];
-        return { cx: e.x2, cy: e.y2 };
+        return { cx: e.x2, cy: e.y2, ux:e.ux, uy:e.uy };
     }
 
     // ---- 4) 各タブを最近エッジへスナップし、全長が入るよう端部を補正 ----
@@ -3964,15 +3973,188 @@ function snapTabsToOffsetOutline(tabSegments, segs) {
             return {
                 cx: e.x1 + (e.x2-e.x1)*bestT,
                 cy: e.y1 + (e.y2-e.y1)*bestT,
-                hw: tab.hw
+                hw: tab.hw, ux:e.ux, uy:e.uy
             };
         }
 
         // タブ全長が直線部からはみ出ないよう、中心を半長ぶん内側にクランプする。
         const clampedArc = Math.max(tab.hw, Math.min(group.totalLen - tab.hw, edgeArc));
         const p = pointAtGroupArc(group, clampedArc);
-        return { cx: p.cx, cy: p.cy, hw: tab.hw };
+        return { cx: p.cx, cy: p.cy, hw: tab.hw, ux:p.ux, uy:p.uy };
     });
+}
+
+// ============================================================
+// 加工後GLB用の2D輪郭・押し出しメッシュ生成
+// ============================================================
+function machiningSegmentsToLoops(segs, tolerance) {
+    const loops = [];
+    let points = null;
+    const tol = Math.max(0.05, tolerance || 0.25);
+    const pushPoint = p => {
+        if (!points) points = [];
+        const last = points[points.length - 1];
+        if (!last || Math.hypot(last.x-p.x, last.y-p.y) > 1e-5) points.push({x:p.x, y:p.y});
+    };
+    const finish = () => {
+        if (!points || points.length < 3) { points = null; return; }
+        if (Math.hypot(points[0].x-points[points.length-1].x, points[0].y-points[points.length-1].y) < 1e-4) points.pop();
+        if (points.length >= 3) {
+            let clean=points;
+            for(let pass=0;pass<2;pass++){
+                const next=[];
+                for(let i=0;i<clean.length;i++){
+                    const prev=clean[(i-1+clean.length)%clean.length],cur=clean[i],after=clean[(i+1)%clean.length];
+                    const a=Math.hypot(cur.x-prev.x,cur.y-prev.y),b=Math.hypot(after.x-cur.x,after.y-cur.y);
+                    if(a<1e-4 || b<1e-4)continue;
+                    const cross=(cur.x-prev.x)*(after.y-cur.y)-(cur.y-prev.y)*(after.x-cur.x);
+                    if(Math.abs(cross)<=1e-7*a*b)continue;
+                    next.push(cur);
+                }
+                if(next.length<3 || next.length===clean.length)break;
+                clean=next;
+            }
+            if(clean.length>=3)loops.push(clean);
+        }
+        points = null;
+    };
+    for (const seg of segs || []) {
+        if (seg.cmd === 'M') { finish(); points=[]; pushPoint(seg); }
+        else if (seg.cmd === 'L') pushPoint(seg);
+        else if (seg.cmd === 'C') {
+            adaptiveSampleCubic(seg.x0,seg.y0,seg.x1,seg.y1,seg.x2,seg.y2,seg.x,seg.y,tol)
+                .forEach(pushPoint);
+        } else if (seg.cmd === 'A') {
+            sampleSvgArc(seg.x0,seg.y0,seg.rx,seg.ry,seg.xRot,seg.largeArc,seg.sweep,seg.x,seg.y,tol,0)
+                .slice(1).forEach(pushPoint);
+        } else if (seg.cmd === 'Z') finish();
+    }
+    finish();
+    return loops;
+}
+
+function machiningLoopSelfIntersects(loop) {
+    const orient=(a,b,c)=>(b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+    const crosses=(a,b,c,d)=>{
+        const ab1=orient(a,b,c),ab2=orient(a,b,d),cd1=orient(c,d,a),cd2=orient(c,d,b);
+        return ((ab1>1e-7&&ab2<-1e-7)||(ab1<-1e-7&&ab2>1e-7)) && ((cd1>1e-7&&cd2<-1e-7)||(cd1<-1e-7&&cd2>1e-7));
+    };
+    for(let i=0;i<loop.length;i++){
+        const i2=(i+1)%loop.length;
+        for(let j=i+1;j<loop.length;j++){
+            const j2=(j+1)%loop.length;
+            if(i===j||i2===j||j2===i)continue;
+            if(crosses(loop[i],loop[i2],loop[j],loop[j2]))return true;
+        }
+    }
+    return false;
+}
+
+function machiningLoopArea(loop) {
+    let area = 0;
+    for (let i=0; i<loop.length; i++) {
+        const p=loop[i], q=loop[(i+1)%loop.length];
+        area += p.x*q.y-q.x*p.y;
+    }
+    return area/2;
+}
+
+function machiningLargestLoop(loops) {
+    return (loops || []).reduce((best, loop) =>
+        !best || Math.abs(machiningLoopArea(loop)) > Math.abs(machiningLoopArea(best)) ? loop : best, null);
+}
+
+function machiningPointInLoop(point, loop) {
+    let inside=false;
+    for(let i=0,j=loop.length-1;i<loop.length;j=i++){
+        const a=loop[i],b=loop[j];
+        if(((a.y>point.y)!==(b.y>point.y)) && point.x < (b.x-a.x)*(point.y-a.y)/((b.y-a.y)||1e-12)+a.x) inside=!inside;
+    }
+    return inside;
+}
+
+function createMachiningExtrusionFromLoops(loops, depth) {
+    const valid=(loops || []).filter(loop=>loop && loop.length>=3);
+    if(!valid.length || !(depth>0))return null;
+    const info=valid.map((loop,index)=>({loop,index,area:Math.abs(machiningLoopArea(loop)),parent:-1,level:0}));
+    info.forEach(item=>{
+        const probe=item.loop[0];let parent=null;
+        info.forEach(candidate=>{
+            if(candidate===item || candidate.area<=item.area || !machiningPointInLoop(probe,candidate.loop))return;
+            if(!parent || candidate.area<parent.area)parent=candidate;
+        });
+        item.parent=parent?parent.index:-1;
+    });
+    const byIndex=new Map(info.map(item=>[item.index,item]));
+    const levelOf=item=>item.parent<0?0:levelOf(byIndex.get(item.parent))+1;
+    info.forEach(item=>item.level=levelOf(item));
+    const shapes=[];
+    info.filter(item=>item.level%2===0).forEach(solid=>{
+        const shape=new THREE.Shape(solid.loop.map(p=>new THREE.Vector2(p.x,p.y)));
+        info.filter(h=>h.parent===solid.index && h.level===solid.level+1).forEach(h=>{
+            shape.holes.push(new THREE.Path(h.loop.map(p=>new THREE.Vector2(p.x,p.y))));
+        });
+        shapes.push(shape);
+    });
+    if(!shapes.length)return null;
+    const geo=new THREE.ExtrudeGeometry(shapes,{depth,steps:1,bevelEnabled:false,curveSegments:8});
+    geo.applyMatrix4(new THREE.Matrix4().set(
+        1,0,0,0,
+        0,0,-1,0,
+        0,1,0,0,
+        0,0,0,1
+    ));
+    return machiningRemoveDegenerateTriangles(geo);
+}
+
+function machiningRemoveDegenerateTriangles(geometry) {
+    const geo=geometry.index ? geometry.toNonIndexed() : geometry;
+    const pos=geo.getAttribute('position'),kept=[];
+    for(let i=0;i+2<pos.count;i+=3){
+        const a=[pos.getX(i),pos.getY(i),pos.getZ(i)],b=[pos.getX(i+1),pos.getY(i+1),pos.getZ(i+1)],c=[pos.getX(i+2),pos.getY(i+2),pos.getZ(i+2)];
+        const ab=[b[0]-a[0],b[1]-a[1],b[2]-a[2]],ac=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
+        const cross=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]];
+        if(Math.hypot(cross[0],cross[1],cross[2])<=1e-8)continue;
+        kept.push(...a,...b,...c);
+    }
+    if(kept.length===pos.count*3){geo.computeVertexNormals();return geo;}
+    const clean=new THREE.BufferGeometry();
+    clean.setAttribute('position',new THREE.Float32BufferAttribute(kept,3));
+    clean.computeVertexNormals();geo.dispose();return clean;
+}
+
+function createMachiningExtrusion(outer, holes, depth) {
+    return createMachiningExtrusionFromLoops([outer].concat(holes || []),depth);
+}
+
+function createMachiningTabGeometry(tab, toolDiameter, tabHeight, materialThickness) {
+    if (!tab || !(tabHeight > 0)) return null;
+    const length = Math.max(0.1, (tab.hw || 0)*2);
+    const width = Math.max(0.1, toolDiameter);
+    const height = Math.min(materialThickness, tabHeight);
+    const geo = new THREE.BoxGeometry(length,height,width);
+    geo.rotateY(-Math.atan2(tab.uy || 0, tab.ux == null ? 1 : tab.ux));
+    geo.translate(tab.cx, -materialThickness + height/2, tab.cy);
+    return geo;
+}
+
+function machiningColorForPart(partEl, fallbackIndex) {
+    const raw = partEl?.dataset?.partColor || '';
+    if (/^#[0-9a-f]{6}$/i.test(raw)) return raw;
+    const fallback = ['#dbeafe','#fde68a','#fecdd3','#d1fae5','#e9d5ff','#fed7aa'];
+    return fallback[fallbackIndex % fallback.length];
+}
+
+function getMachiningLayoutSignature() {
+    const svg=document.querySelector('#svg-container svg');
+    if(!svg)return '';
+    const parts=Array.from(svg.querySelectorAll('g[data-x][id^="part-"]')).map(part=>({
+        id:part.id,x:part.dataset.x,y:part.dataset.y,angle:part.dataset.angle,w:part.dataset.partW,h:part.dataset.partH,
+        paths:Array.from(part.querySelectorAll('.part-outline path')).map(p=>p.getAttribute('d') || ''),
+        tabs:Array.from(part.querySelectorAll('.tab-marker')).map(t=>[t.getAttribute('data-tx'),t.getAttribute('data-ty')])
+    }));
+    const boards=getBoardsSpecSafe().map(b=>({length:b.length,width:b.width,xOffset:b.xOffset || 0}));
+    return JSON.stringify({parts,boards,tool:document.getElementById('tool-diameter')?.value || '',tabHeight:document.getElementById('tab-height-input')?.value || ''});
 }
 
 // ============================================================
@@ -4075,6 +4257,7 @@ function generateAndDownloadGcode() {
 
     const boardIndices = Array.from(boardPartMap.keys()).sort((a, b) => a - b);
     const generatedGcodes = [];
+    const machinedBoards = [];
 
     boardIndices.forEach(boardIdx => {
         const boardSpec = specs[boardIdx] || specs[0];
@@ -4096,6 +4279,9 @@ function generateAndDownloadGcode() {
         });
 
         const gcodeStats = { tabMarkers: 0, tabUpEvents: 0, finalTabUpEvents: 0 };
+        const machinedParts = [];
+        const stockHoles = [];
+        const machinedTabs = [];
         const addLine = makeLineAdder();
         const gcLines = [];
 
@@ -4123,7 +4309,7 @@ function generateAndDownloadGcode() {
         gcLines.push(addLine(`X0.000Y0.000F${feedRate.toFixed(1)}`));
 
         // 各部品のパス（ソート済み）
-        sortedParts.forEach((partEl) => {
+        sortedParts.forEach((partEl, sortedPartIndex) => {
             const offsetX = (parseFloat(partEl.dataset.x     || '0') || 0) - boardXOffset;
             const offsetY = parseFloat(partEl.dataset.y     || '0') || 0;
             const angle   = parseFloat(partEl.dataset.angle || '0') || 0;
@@ -4162,6 +4348,7 @@ function generateAndDownloadGcode() {
                 const s = getTransformedSegments(pe, offsetX, offsetY, angle, partW, partH);
                 allPathSegs.push(s);
             });
+            const machiningContours = [];
             let partBBox = null;
             {
                 let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
@@ -4183,9 +4370,62 @@ function generateAndDownloadGcode() {
                 // 工具中心線を外側へミル半径分オフセットする。
                 const offsetSegs = applyToolRadiusOffset(segs, millDiam / 2, partBBox);
                 const offsetTabs = snapTabsToOffsetOutline(tabSegments, offsetSegs);
+                machiningContours.push({segs, offsetSegs, offsetTabs});
                 const tabbedSegs = insertTabsIntoSegments(offsetSegs, offsetTabs, pass2Z, TAB_HEIGHT_Z, svgH);
                 segmentsToGcodeLines(tabbedSegs, svgH, feedRate, plungeRate, clearH, pass1Z, pass2Z, addLine, gcLines, gcodeStats);
             });
+
+            // Gコードと同じ配置済み輪郭から、部品・残材・タブの独立メッシュを作る。
+            const designLoops = machiningContours.flatMap(c => machiningSegmentsToLoops(c.segs));
+            const outer = machiningLargestLoop(designLoops);
+            if (outer) {
+                const partNo = sortedPartIndex + 1;
+                const partId = partEl.id || `part-${partNo}`;
+                const partGeometry = createMachiningExtrusionFromLoops(designLoops, matThick);
+                if (partGeometry) machinedParts.push({
+                    geometry:partGeometry,
+                    name:`Part_${String(partNo).padStart(3,'0')}`,
+                    color:machiningColorForPart(partEl, sortedPartIndex),
+                    extras:{role:'part',boardIndex:boardIdx,partIndex:sortedPartIndex,partId,units:'millimeters'}
+                });
+
+                // 残材境界は設計輪郭から工具直径ぶんを一度だけオフセットする。
+                // 「工具半径オフセット済み中心線」を再オフセットすると、凹角の
+                // miter/逃げ加工点が自己交差し、Stock上面に長い三角スパイクが出る。
+                // 設計輪郭からの単一計算なら、工具中心までの半径＋工具外周までの
+                // 半径（合計=工具直径）を同時に表せる。
+                machiningContours.forEach(contour => {
+                    const stockSideLoops=machiningSegmentsToLoops(applyToolRadiusOffset(contour.segs,millDiam,partBBox));
+                    const centerLoops=machiningSegmentsToLoops(contour.offsetSegs);
+                    const designBoundaryLoops=machiningSegmentsToLoops(contour.segs);
+                    stockSideLoops.forEach((loop,loopIndex)=>{
+                        if(!machiningLoopSelfIntersects(loop))stockHoles.push(loop);
+                        else{
+                            const fallback=centerLoops[loopIndex];
+                            if(fallback && !machiningLoopSelfIntersects(fallback)){
+                                console.warn('残材境界の自己交差を検出したため工具中心輪郭へフォールバックしました。',partId,loopIndex);
+                                stockHoles.push(fallback);
+                            }else{
+                                const designFallback=designBoundaryLoops[loopIndex];
+                                if(!designFallback || machiningLoopSelfIntersects(designFallback))throw new Error(`残材境界を生成できませんでした: ${partId} / contour ${loopIndex+1}`);
+                                console.warn('オフセット輪郭が自己交差したため、安定性を優先して設計輪郭へフォールバックしました。',partId,loopIndex);
+                                stockHoles.push(designFallback);
+                            }
+                        }
+                    });
+                });
+                const allExportTabs=machiningContours.flatMap(contour=>contour.offsetTabs || []);
+                allExportTabs.forEach((tab, tabIndex) => {
+                    const tabGeometry=createMachiningTabGeometry(tab,millDiam,TAB_H,matThick);
+                    if (!tabGeometry) return;
+                    machinedTabs.push({
+                        geometry:tabGeometry,
+                        name:`Tab_${String(partNo).padStart(3,'0')}_${String(tabIndex+1).padStart(2,'0')}`,
+                        color:'#c58b45',
+                        extras:{role:'tab',boardIndex:boardIdx,connectedPartId:partId,tabIndex,length:tab.hw*2,remainingHeight:Math.min(TAB_H,matThick),toolDiameter:millDiam,units:'millimeters'}
+                    });
+                });
+            }
         });
 
         for (let i = gcLines.length - 2; i >= 0; i--) {
@@ -4217,6 +4457,17 @@ function generateAndDownloadGcode() {
             tabStats: { ...gcodeStats }
         });
 
+        const stockOuter=[{x:0,y:0},{x:bLength,y:0},{x:bLength,y:bWidth},{x:0,y:bWidth}];
+        const stockGeometry=createMachiningExtrusionFromLoops([stockOuter].concat(stockHoles),matThick);
+        machinedBoards.push({
+            boardIndex:boardIdx,
+            name:`Board_${String(boardIdx+1).padStart(2,'0')}`,
+            xOffset:boardXOffset,
+            stock:stockGeometry ? [{geometry:stockGeometry,name:`Stock_${String(boardIdx+1).padStart(2,'0')}`,color:'#b98b5b',extras:{role:'stock',boardIndex:boardIdx,length:bLength,width:bWidth,thickness:matThick,units:'millimeters'}}] : [],
+            parts:machinedParts,
+            tabs:machinedTabs
+        });
+
         // ダウンロード
         const blob = new Blob([gcodeText], { type: 'text/plain;charset=utf-8' });
         const url  = URL.createObjectURL(blob);
@@ -4231,6 +4482,7 @@ function generateAndDownloadGcode() {
 
     // Gコードビュワー用にグローバルに保持（板ごとの配列）
     window.__lastGeneratedGcodes = generatedGcodes;
+    window.__lastCncModel = {version:1,sourceFile:currentStlFileName || '',toolDiameter:millDiam,materialThickness:matThick,layoutSignature:getMachiningLayoutSignature(),boards:machinedBoards};
     window.__lastGcodeMatThick = matThick;
     // 後方互換
     window.__lastGeneratedGcode = generatedGcodes.length > 0 ? generatedGcodes[0].gcode : '';
@@ -4243,6 +4495,111 @@ function generateAndDownloadGcode() {
     }).join('\n');
     alert(`Gコードを生成しました。\n工具: ${preset.label}\nファイル数: ${generatedGcodes.length}\n${summaryLines}`);
 }
+
+function colorHexToFactor(hex) {
+    const m=String(hex || '').match(/^#?([0-9a-f]{6})$/i);
+    const n=m ? parseInt(m[1],16) : 0xcccccc;
+    return [((n>>16)&255)/255,((n>>8)&255)/255,(n&255)/255,1];
+}
+
+function buildMachinedGlb(model) {
+    const accessors=[],bufferViews=[],meshDefs=[],materialDefs=[],nodes=[],binParts=[];
+    let byteOffset=0;
+    const appendBuffer=(typed,target) => {
+        const bytes=new Uint8Array(typed.buffer,typed.byteOffset,typed.byteLength);
+        const viewIndex=bufferViews.length;
+        bufferViews.push({buffer:0,byteOffset,byteLength:bytes.byteLength,target});
+        binParts.push(new Uint8Array(bytes));
+        byteOffset+=bytes.byteLength;
+        const pad=(4-byteOffset%4)%4;
+        if(pad){binParts.push(new Uint8Array(pad));byteOffset+=pad;}
+        return viewIndex;
+    };
+    const addAccessor=(typed,type,count,target,min,max) => {
+        const bufferView=appendBuffer(typed,target);
+        const componentType=typed instanceof Float32Array?5126:(typed instanceof Uint32Array?5125:5123);
+        const a={bufferView,componentType,count,type};
+        if(min)a.min=min;if(max)a.max=max;
+        accessors.push(a);return accessors.length-1;
+    };
+    const addMeshNode=entry => {
+        const geo=entry.geometry;
+        const pos=geo?.getAttribute?.('position');
+        if(!pos || !pos.count)return -1;
+        const posArr=new Float32Array(pos.count*3),pMin=[Infinity,Infinity,Infinity],pMax=[-Infinity,-Infinity,-Infinity];
+        for(let i=0;i<pos.count;i++){
+            const x=pos.getX(i),y=pos.getY(i),z=pos.getZ(i);
+            posArr.set([x,y,z],i*3);
+            pMin[0]=Math.min(pMin[0],x);pMin[1]=Math.min(pMin[1],y);pMin[2]=Math.min(pMin[2],z);
+            pMax[0]=Math.max(pMax[0],x);pMax[1]=Math.max(pMax[1],y);pMax[2]=Math.max(pMax[2],z);
+        }
+        const attributes={POSITION:addAccessor(posArr,'VEC3',pos.count,34962,pMin,pMax)};
+        const norm=geo.getAttribute('normal');
+        if(norm){
+            const arr=new Float32Array(norm.count*3);
+            for(let i=0;i<norm.count;i++)arr.set([norm.getX(i),norm.getY(i),norm.getZ(i)],i*3);
+            attributes.NORMAL=addAccessor(arr,'VEC3',norm.count,34962);
+        }
+        const prim={attributes};
+        if(geo.index){
+            const use32=pos.count>65535||geo.index.count>65535;
+            const arr=use32?new Uint32Array(geo.index.count):new Uint16Array(geo.index.count);
+            for(let i=0;i<geo.index.count;i++)arr[i]=geo.index.getX(i);
+            prim.indices=addAccessor(arr,'SCALAR',arr.length,34963);
+        }
+        prim.material=materialDefs.length;
+        materialDefs.push({name:`${entry.name}_Material`,pbrMetallicRoughness:{baseColorFactor:colorHexToFactor(entry.color),metallicFactor:0,roughnessFactor:.82},doubleSided:true});
+        const meshIndex=meshDefs.length;
+        meshDefs.push({name:entry.name,primitives:[prim]});
+        nodes.push({name:entry.name,mesh:meshIndex,extras:entry.extras || {}});
+        return nodes.length-1;
+    };
+
+    const boardNodeIndices=[];
+    (model.boards || []).forEach(board => {
+        const roleGroups=[];
+        [['Stock',board.stock],['Parts',board.parts],['Tabs',board.tabs]].forEach(([name,entries]) => {
+            const children=(entries || []).map(addMeshNode).filter(i=>i>=0);
+            const group={name,extras:{role:name.toLowerCase(),boardIndex:board.boardIndex}};
+            if(children.length)group.children=children;
+            nodes.push(group);roleGroups.push(nodes.length-1);
+        });
+        nodes.push({name:board.name,children:roleGroups,translation:[board.xOffset || 0,0,0],extras:{role:'board',boardIndex:board.boardIndex,units:'millimeters'}});
+        boardNodeIndices.push(nodes.length-1);
+    });
+    nodes.push({name:'CNC_Result',children:boardNodeIndices,scale:[.001,.001,.001],extras:{units:'millimeters',sourceFile:model.sourceFile || '',toolDiameter:model.toolDiameter,materialThickness:model.materialThickness}});
+    const rootIndex=nodes.length-1;
+    const gltf={asset:{version:'2.0',generator:'Kidorin for CNC'},scene:0,scenes:[{name:'CNC_Result',nodes:[rootIndex]}],nodes,meshes:meshDefs,materials:materialDefs,accessors,bufferViews,buffers:[{byteLength:byteOffset}]};
+    let jsonBytes=new TextEncoder().encode(JSON.stringify(gltf));
+    const jsonPad=(4-jsonBytes.byteLength%4)%4;
+    if(jsonPad){const padded=new Uint8Array(jsonBytes.byteLength+jsonPad);padded.set(jsonBytes);padded.fill(0x20,jsonBytes.byteLength);jsonBytes=padded;}
+    const total=12+8+jsonBytes.byteLength+8+byteOffset;
+    const glb=new ArrayBuffer(total),dv=new DataView(glb);let o=0;
+    dv.setUint32(o,0x46546c67,true);o+=4;dv.setUint32(o,2,true);o+=4;dv.setUint32(o,total,true);o+=4;
+    dv.setUint32(o,jsonBytes.byteLength,true);o+=4;dv.setUint32(o,0x4e4f534a,true);o+=4;new Uint8Array(glb,o,jsonBytes.byteLength).set(jsonBytes);o+=jsonBytes.byteLength;
+    dv.setUint32(o,byteOffset,true);o+=4;dv.setUint32(o,0x004e4942,true);o+=4;
+    for(const part of binParts){new Uint8Array(glb,o,part.byteLength).set(part);o+=part.byteLength;}
+    return glb;
+}
+
+window.kidorinExportMachinedGLB=function(){
+    const model=window.__lastCncModel;
+    if(!model || !model.boards || model.boards.length===0){
+        alert('先に「CNC Gコードを生成」を実行してください。そこで指定した材料厚・工具径・タブ設定を加工後モデルに使用します。');
+        return;
+    }
+    if(model.layoutSignature!==getMachiningLayoutSignature()){
+        alert('配置・板寸法・工具径またはタブ設定がGコード生成後に変更されています。Gコードを再生成してから加工後GLBを出力してください。');
+        return;
+    }
+    try{
+        const blob=new Blob([buildMachinedGlb(model)],{type:'model/gltf-binary'});
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);
+        const base=(currentStlFileName || 'kidorin').replace(/\.stl$/i,'').replace(/[^\w\u3000-\u9fff-]+/g,'_');
+        a.download=`${base}_加工後.glb`;a.click();URL.revokeObjectURL(a.href);
+    }catch(e){console.error(e);alert(`加工後GLBの生成に失敗しました: ${e.message || e}`);}
+};
 
 // ================================================================
 // タブ設定機能
