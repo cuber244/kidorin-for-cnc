@@ -4138,6 +4138,41 @@ function createMachiningTabGeometry(tab, toolDiameter, tabHeight, materialThickn
     return geo;
 }
 
+function createMachiningGuideGeometryFromSegments(segs, width, y) {
+    const positions=[];
+    const addRect=(a,b) => {
+        const len=Math.hypot(b.x-a.x,b.y-a.y);if(len<1e-5)return;
+        const ux=(b.x-a.x)/len,uy=(b.y-a.y)/len,nx=-uy,ny=ux;
+        const halfW=Math.max(.1,width/2),extend=Math.min(halfW,len/2);
+        const ax=a.x-ux*extend,ay=a.y-uy*extend,bx=b.x+ux*extend,by=b.y+uy*extend;
+        const p0=[ax+nx*halfW,y,ay+ny*halfW],p1=[ax-nx*halfW,y,ay-ny*halfW];
+        const p2=[bx-nx*halfW,y,by-ny*halfW],p3=[bx+nx*halfW,y,by+ny*halfW];
+        positions.push(...p0,...p1,...p2,...p0,...p2,...p3);
+    };
+    machiningSegmentsToLoops(segs).forEach(loop=>{
+        for(let i=0;i<loop.length;i++)addRect(loop[i],loop[(i+1)%loop.length]);
+    });
+    if(!positions.length)return null;
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+    const normals=new Float32Array(positions.length);for(let i=0;i<normals.length;i+=3)normals[i+1]=1;
+    geo.setAttribute('normal',new THREE.BufferAttribute(normals,3));
+    return geo;
+}
+
+function createMachiningTabMarkerGeometry(tab, toolDiameter) {
+    const ux=tab.ux == null?1:tab.ux,uy=tab.uy || 0,halfL=Math.max(.1,tab.hw || 0),halfW=Math.max(1,toolDiameter/2+1);
+    const nx=-uy,ny=ux,cx=tab.cx,cy=tab.cy,y=.65;
+    const p0=[cx-ux*halfL+nx*halfW,y,cy-uy*halfL+ny*halfW];
+    const p1=[cx-ux*halfL-nx*halfW,y,cy-uy*halfL-ny*halfW];
+    const p2=[cx+ux*halfL-nx*halfW,y,cy+uy*halfL-ny*halfW];
+    const p3=[cx+ux*halfL+nx*halfW,y,cy+uy*halfL+ny*halfW];
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute([...p0,...p1,...p2,...p0,...p2,...p3],3));
+    geo.setAttribute('normal',new THREE.Float32BufferAttribute([0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0],3));
+    return geo;
+}
+
 function machiningColorForPart(partEl, fallbackIndex) {
     const raw = partEl?.dataset?.partColor || '';
     if (/^#[0-9a-f]{6}$/i.test(raw)) return raw;
@@ -4282,6 +4317,8 @@ function generateAndDownloadGcode() {
         const machinedParts = [];
         const stockHoles = [];
         const machinedTabs = [];
+        const machiningCutPaths = [];
+        const machiningTabMarkers = [];
         const addLine = makeLineAdder();
         const gcLines = [];
 
@@ -4415,14 +4452,30 @@ function generateAndDownloadGcode() {
                     });
                 });
                 const allExportTabs=machiningContours.flatMap(contour=>contour.offsetTabs || []);
+                machiningContours.forEach((contour,contourIndex)=>{
+                    const guideGeometry=createMachiningGuideGeometryFromSegments(contour.offsetSegs,millDiam,.35);
+                    if(guideGeometry)machiningCutPaths.push({
+                        geometry:guideGeometry,
+                        name:`CutPath_${String(partNo).padStart(3,'0')}_${String(contourIndex+1).padStart(2,'0')}`,
+                        color:'#ff9f1c',
+                        extras:{role:'cutPath',visualizationOnly:true,boardIndex:boardIdx,connectedPartId:partId,contourIndex,toolDiameter:millDiam,units:'millimeters'}
+                    });
+                });
                 allExportTabs.forEach((tab, tabIndex) => {
                     const tabGeometry=createMachiningTabGeometry(tab,millDiam,TAB_H,matThick);
                     if (!tabGeometry) return;
+                    const tabName=`${String(partNo).padStart(3,'0')}_${String(tabIndex+1).padStart(2,'0')}`;
                     machinedTabs.push({
                         geometry:tabGeometry,
-                        name:`Tab_${String(partNo).padStart(3,'0')}_${String(tabIndex+1).padStart(2,'0')}`,
+                        name:`Tab_${tabName}`,
                         color:'#c58b45',
                         extras:{role:'tab',boardIndex:boardIdx,connectedPartId:partId,tabIndex,length:tab.hw*2,remainingHeight:Math.min(TAB_H,matThick),toolDiameter:millDiam,units:'millimeters'}
+                    });
+                    machiningTabMarkers.push({
+                        geometry:createMachiningTabMarkerGeometry(tab,millDiam),
+                        name:`TabMarker_${tabName}`,
+                        color:'#ff2d95',
+                        extras:{role:'tabMarker',visualizationOnly:true,boardIndex:boardIdx,connectedPartId:partId,tabIndex,length:tab.hw*2,toolDiameter:millDiam,units:'millimeters'}
                     });
                 });
             }
@@ -4465,7 +4518,9 @@ function generateAndDownloadGcode() {
             xOffset:boardXOffset,
             stock:stockGeometry ? [{geometry:stockGeometry,name:`Stock_${String(boardIdx+1).padStart(2,'0')}`,color:'#b98b5b',extras:{role:'stock',boardIndex:boardIdx,length:bLength,width:bWidth,thickness:matThick,units:'millimeters'}}] : [],
             parts:machinedParts,
-            tabs:machinedTabs
+            tabs:machinedTabs,
+            cutPaths:machiningCutPaths,
+            tabMarkers:machiningTabMarkers
         });
 
         // ダウンロード
@@ -4548,7 +4603,10 @@ function buildMachinedGlb(model) {
             prim.indices=addAccessor(arr,'SCALAR',arr.length,34963);
         }
         prim.material=materialDefs.length;
-        materialDefs.push({name:`${entry.name}_Material`,pbrMetallicRoughness:{baseColorFactor:colorHexToFactor(entry.color),metallicFactor:0,roughnessFactor:.82},doubleSided:true});
+        const baseColor=colorHexToFactor(entry.color);
+        const materialDef={name:`${entry.name}_Material`,pbrMetallicRoughness:{baseColorFactor:baseColor,metallicFactor:0,roughnessFactor:.82},doubleSided:true};
+        if(entry.extras?.visualizationOnly)materialDef.emissiveFactor=baseColor.slice(0,3).map(v=>Math.min(1,v*.45));
+        materialDefs.push(materialDef);
         const meshIndex=meshDefs.length;
         meshDefs.push({name:entry.name,primitives:[prim]});
         nodes.push({name:entry.name,mesh:meshIndex,extras:entry.extras || {}});
@@ -4558,7 +4616,7 @@ function buildMachinedGlb(model) {
     const boardNodeIndices=[];
     (model.boards || []).forEach(board => {
         const roleGroups=[];
-        [['Stock',board.stock],['Parts',board.parts],['Tabs',board.tabs]].forEach(([name,entries]) => {
+        [['Stock',board.stock],['Parts',board.parts],['Tabs',board.tabs],['CutPaths',board.cutPaths],['TabMarkers',board.tabMarkers]].forEach(([name,entries]) => {
             const children=(entries || []).map(addMeshNode).filter(i=>i>=0);
             const group={name,extras:{role:name.toLowerCase(),boardIndex:board.boardIndex}};
             if(children.length)group.children=children;
