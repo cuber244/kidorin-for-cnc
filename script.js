@@ -468,6 +468,7 @@ function syncJointViewer() {
 <button id="stl-export-btn" onclick="exportSTL()">STLエクスポート</button>
 <button id="glb-export-btn" onclick="exportGLB()">GLBエクスポート</button>
 <button id="machined-glb-export-btn" onclick="exportMachinedGLB()">加工後GLB</button>
+<a id="machined-glb-download-link" style="display:none;position:absolute;right:460px;top:78px;color:#fff;background:rgba(40,167,69,.82);padding:7px 12px;border-radius:5px;text-decoration:none;z-index:10"></a>
 <button id="joint-edit-btn" onclick="toggleJointEditMode()">交差部編集</button>
 <button id="view-mode-btn" onclick="toggleMaterialViewMode()">表示：不透過</button>
 <button id="close-btn" onclick="window.close()">閉じる</button>
@@ -480,34 +481,28 @@ function syncJointViewer() {
 const COLORS = ${JSON.stringify(colors)};
 let parentGeosData = ${geometriesJson};
 let parentJointData = ${jointsJson};
-let pendingMachinedDownload=null;
 let machinedButtonResetTimer=null;
 
 async function exportMachinedGLB(){
   const btn=document.getElementById('machined-glb-export-btn');
-  if(!window.opener || window.opener.closed || typeof window.opener.kidorinExportMachinedGLB!=='function'){
-    alert('親画面で加工後GLBを生成できません。');return;
-  }
-  if(pendingMachinedDownload){
-    const saved=window.opener.kidorinRetryMachinedGLBDownload?.(pendingMachinedDownload);
-    if(saved){
-      btn.textContent='保存を再実行しました';
-      clearTimeout(machinedButtonResetTimer);
-      machinedButtonResetTimer=setTimeout(()=>{pendingMachinedDownload=null;btn.textContent='加工後GLB';},2500);
-    }
-    return;
-  }
+  const saveLink=document.getElementById('machined-glb-download-link');
   btn.disabled=true;btn.textContent='加工後GLB 処理中…';
-  // ボタンの状態を先に描画してから、親画面側の重いバイナリ生成を開始する。
-  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  saveLink.style.display='none';saveLink.removeAttribute('href');saveLink.removeAttribute('download');
+  if(!window.opener || window.opener.closed || typeof window.opener.kidorinExportMachinedGLB!=='function'){
+    alert('親画面で加工後GLBを生成できません。');btn.textContent='加工後GLB';btn.disabled=false;return;
+  }
   try{
+    // 対応ブラウザでは、この呼び出し直後に標準の保存先選択画面が開く。
     const result=await window.opener.kidorinExportMachinedGLB();
     if(result?.ok){
-      pendingMachinedDownload=result.downloadId;
-      btn.textContent='完了 ('+result.sizeMB+' MB)・未保存なら再クリック';
-      btn.disabled=false;
+      btn.textContent='完了 ('+result.sizeMB+' MB)';btn.disabled=false;
+      if(!result.saved && result.objectUrl){
+        saveLink.href=result.objectUrl;saveLink.download=result.fileName;
+        saveLink.textContent='ここを押して保存: '+result.fileName;saveLink.style.display='block';
+        btn.textContent='生成完了・下のリンクから保存';
+      }
       clearTimeout(machinedButtonResetTimer);
-      machinedButtonResetTimer=setTimeout(()=>{pendingMachinedDownload=null;btn.textContent='加工後GLB';},60000);
+      machinedButtonResetTimer=setTimeout(()=>{btn.textContent='加工後GLB';},4000);
     }else{
       btn.textContent='加工後GLB';btn.disabled=false;
     }
@@ -4636,40 +4631,42 @@ window.kidorinExportMachinedGLB=async function(){
     }
     const physicalTabCount=model.boards.reduce((sum,board)=>sum+(board.tabs?.length || 0),0);
     if(physicalTabCount===0 && !confirm('この加工後モデルにはタブが1個もありません。\n「タブ自動配置」または「タブ設定」を行い、Gコードを再生成すると物理タブが出力されます。\nタブなしで出力を続けますか？'))return {ok:false};
+    const base=(currentStlFileName || 'kidorin').replace(/\.stl$/i,'').replace(/[^\w\u3000-\u9fff-]+/g,'_');
+    const fileName=`${base}_加工後.glb`;
+    let fileHandle=null;
+    if(typeof window.showSaveFilePicker==='function'){
+        try{
+            fileHandle=await window.showSaveFilePicker({suggestedName:fileName,types:[{description:'glTF Binary',accept:{'model/gltf-binary':['.glb']}}]});
+        }catch(e){
+            if(e?.name==='AbortError')return {ok:false,cancelled:true};
+            console.warn('標準保存画面を使用できないため、保存リンクへ切り替えます。',e);
+        }
+    }
     try{
+        // 保存リンク方式ではユーザー操作権限を保持する必要がないため、先に処理中表示を描画する。
+        if(!fileHandle)await new Promise(resolve=>setTimeout(resolve,50));
         const blob=new Blob([buildMachinedGlb(model)],{type:'model/gltf-binary'});
-        const a=document.createElement('a');
+        if(fileHandle){
+            const writable=await fileHandle.createWritable();
+            await writable.write(blob);await writable.close();
+            return {ok:true,saved:true,fileName,sizeMB:(blob.size/1024/1024).toFixed(1)};
+        }
         if(window.__machinedGlbDownload?.objectUrl)URL.revokeObjectURL(window.__machinedGlbDownload.objectUrl);
         const objectUrl=URL.createObjectURL(blob);
         const downloadId=`machined-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        a.href=objectUrl;
-        const base=(currentStlFileName || 'kidorin').replace(/\.stl$/i,'').replace(/[^\w\u3000-\u9fff-]+/g,'_');
-        a.download=`${base}_加工後.glb`;
-        a.style.display='none';document.body.appendChild(a);a.click();a.remove();
-        window.__machinedGlbDownload={downloadId,objectUrl,fileName:a.download};
-        // 自動保存がブロックされた場合の再クリック用に、URLを1分間保持する。
+        window.__machinedGlbDownload={downloadId,objectUrl,fileName};
+        // 非対応ブラウザで表示する保存リンク用に、URLを5分間保持する。
         setTimeout(()=>{
             if(window.__machinedGlbDownload?.downloadId===downloadId){
                 URL.revokeObjectURL(objectUrl);window.__machinedGlbDownload=null;
             }
-        },60000);
-        return {ok:true,downloadId,fileName:a.download,sizeMB:(blob.size/1024/1024).toFixed(1)};
+        },300000);
+        return {ok:true,saved:false,downloadId,objectUrl,fileName,sizeMB:(blob.size/1024/1024).toFixed(1)};
     }catch(e){
         window.__lastMachinedExportError=String(e?.stack || e);
         console.error(e);alert(`加工後GLBの生成に失敗しました: ${e.message || e}`);
         return {ok:false,error:String(e?.message || e)};
     }
-};
-
-window.kidorinRetryMachinedGLBDownload=function(downloadId){
-    const pending=window.__machinedGlbDownload;
-    if(!pending || pending.downloadId!==downloadId){
-        alert('保存データの有効期限が切れました。もう一度「加工後GLB」を押して生成してください。');
-        return false;
-    }
-    const a=document.createElement('a');a.href=pending.objectUrl;a.download=pending.fileName;
-    a.style.display='none';document.body.appendChild(a);a.click();a.remove();
-    return true;
 };
 
 // ================================================================
