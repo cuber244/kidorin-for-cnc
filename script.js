@@ -4073,9 +4073,8 @@ function machiningPointInLoop(point, loop) {
     return inside;
 }
 
-function createMachiningExtrusionFromLoops(loops, depth) {
+function machiningClassifyLoops(loops) {
     const valid=(loops || []).filter(loop=>loop && loop.length>=3);
-    if(!valid.length || !(depth>0))return null;
     const info=valid.map((loop,index)=>({loop,index,area:Math.abs(machiningLoopArea(loop)),parent:-1,level:0}));
     info.forEach(item=>{
         const probe=item.loop[0];let parent=null;
@@ -4088,6 +4087,13 @@ function createMachiningExtrusionFromLoops(loops, depth) {
     const byIndex=new Map(info.map(item=>[item.index,item]));
     const levelOf=item=>item.parent<0?0:levelOf(byIndex.get(item.parent))+1;
     info.forEach(item=>item.level=levelOf(item));
+    return info;
+}
+
+function createMachiningExtrusionFromLoops(loops, depth) {
+    if(!(depth>0))return null;
+    const info=machiningClassifyLoops(loops);
+    if(!info.length)return null;
     const shapes=[];
     info.filter(item=>item.level%2===0).forEach(solid=>{
         const shape=new THREE.Shape(solid.loop.map(p=>new THREE.Vector2(p.x,p.y)));
@@ -4135,41 +4141,6 @@ function createMachiningTabGeometry(tab, toolDiameter, tabHeight, materialThickn
     const geo = new THREE.BoxGeometry(length,height,width);
     geo.rotateY(-Math.atan2(tab.uy || 0, tab.ux == null ? 1 : tab.ux));
     geo.translate(tab.cx, -materialThickness + height/2, tab.cy);
-    return geo;
-}
-
-function createMachiningGuideGeometryFromSegments(segs, width, y) {
-    const positions=[];
-    const addRect=(a,b) => {
-        const len=Math.hypot(b.x-a.x,b.y-a.y);if(len<1e-5)return;
-        const ux=(b.x-a.x)/len,uy=(b.y-a.y)/len,nx=-uy,ny=ux;
-        const halfW=Math.max(.1,width/2),extend=Math.min(halfW,len/2);
-        const ax=a.x-ux*extend,ay=a.y-uy*extend,bx=b.x+ux*extend,by=b.y+uy*extend;
-        const p0=[ax+nx*halfW,y,ay+ny*halfW],p1=[ax-nx*halfW,y,ay-ny*halfW];
-        const p2=[bx-nx*halfW,y,by-ny*halfW],p3=[bx+nx*halfW,y,by+ny*halfW];
-        positions.push(...p0,...p1,...p2,...p0,...p2,...p3);
-    };
-    machiningSegmentsToLoops(segs).forEach(loop=>{
-        for(let i=0;i<loop.length;i++)addRect(loop[i],loop[(i+1)%loop.length]);
-    });
-    if(!positions.length)return null;
-    const geo=new THREE.BufferGeometry();
-    geo.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
-    const normals=new Float32Array(positions.length);for(let i=0;i<normals.length;i+=3)normals[i+1]=1;
-    geo.setAttribute('normal',new THREE.BufferAttribute(normals,3));
-    return geo;
-}
-
-function createMachiningTabMarkerGeometry(tab, toolDiameter) {
-    const ux=tab.ux == null?1:tab.ux,uy=tab.uy || 0,halfL=Math.max(.1,tab.hw || 0),halfW=Math.max(1,toolDiameter/2+1);
-    const nx=-uy,ny=ux,cx=tab.cx,cy=tab.cy,y=.65;
-    const p0=[cx-ux*halfL+nx*halfW,y,cy-uy*halfL+ny*halfW];
-    const p1=[cx-ux*halfL-nx*halfW,y,cy-uy*halfL-ny*halfW];
-    const p2=[cx+ux*halfL-nx*halfW,y,cy+uy*halfL-ny*halfW];
-    const p3=[cx+ux*halfL+nx*halfW,y,cy+uy*halfL+ny*halfW];
-    const geo=new THREE.BufferGeometry();
-    geo.setAttribute('position',new THREE.Float32BufferAttribute([...p0,...p1,...p2,...p0,...p2,...p3],3));
-    geo.setAttribute('normal',new THREE.Float32BufferAttribute([0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0],3));
     return geo;
 }
 
@@ -4317,8 +4288,6 @@ function generateAndDownloadGcode() {
         const machinedParts = [];
         const stockHoles = [];
         const machinedTabs = [];
-        const machiningCutPaths = [];
-        const machiningTabMarkers = [];
         const addLine = makeLineAdder();
         const gcLines = [];
 
@@ -4413,7 +4382,9 @@ function generateAndDownloadGcode() {
             });
 
             // Gコードと同じ配置済み輪郭から、部品・残材・タブの独立メッシュを作る。
-            const designLoops = machiningContours.flatMap(c => machiningSegmentsToLoops(c.segs));
+            const designLoopsByContour=machiningContours.map(c=>machiningSegmentsToLoops(c.segs));
+            const designLoops=designLoopsByContour.flat();
+            const designLoopLevels=new Map(machiningClassifyLoops(designLoops).map(info=>[info.loop,info.level]));
             const outer = machiningLargestLoop(designLoops);
             if (outer) {
                 const partNo = sortedPartIndex + 1;
@@ -4426,16 +4397,21 @@ function generateAndDownloadGcode() {
                     extras:{role:'part',boardIndex:boardIdx,partIndex:sortedPartIndex,partId,units:'millimeters'}
                 });
 
+                // Stockから除去するのは各部品の最外周だけ。内側の穴・スロットまで
+                // Stock輪郭へ渡すと、包含の偶奇判定で「廃材島」が全厚ソリッドとして
+                // 復活し、ドリル切削部を塞いでしまう。内側加工は空間のまま残す。
                 // 残材境界は設計輪郭から工具直径ぶんを一度だけオフセットする。
                 // 「工具半径オフセット済み中心線」を再オフセットすると、凹角の
                 // miter/逃げ加工点が自己交差し、Stock上面に長い三角スパイクが出る。
                 // 設計輪郭からの単一計算なら、工具中心までの半径＋工具外周までの
                 // 半径（合計=工具直径）を同時に表せる。
-                machiningContours.forEach(contour => {
+                machiningContours.forEach((contour,contourIndex) => {
                     const stockSideLoops=machiningSegmentsToLoops(applyToolRadiusOffset(contour.segs,millDiam,partBBox));
                     const centerLoops=machiningSegmentsToLoops(contour.offsetSegs);
-                    const designBoundaryLoops=machiningSegmentsToLoops(contour.segs);
+                    const designBoundaryLoops=designLoopsByContour[contourIndex] || [];
                     stockSideLoops.forEach((loop,loopIndex)=>{
+                        const designLoop=designBoundaryLoops[loopIndex];
+                        if(!designLoop || designLoopLevels.get(designLoop)!==0)return;
                         if(!machiningLoopSelfIntersects(loop))stockHoles.push(loop);
                         else{
                             const fallback=centerLoops[loopIndex];
@@ -4452,15 +4428,6 @@ function generateAndDownloadGcode() {
                     });
                 });
                 const allExportTabs=machiningContours.flatMap(contour=>contour.offsetTabs || []);
-                machiningContours.forEach((contour,contourIndex)=>{
-                    const guideGeometry=createMachiningGuideGeometryFromSegments(contour.offsetSegs,millDiam,.35);
-                    if(guideGeometry)machiningCutPaths.push({
-                        geometry:guideGeometry,
-                        name:`CutPath_${String(partNo).padStart(3,'0')}_${String(contourIndex+1).padStart(2,'0')}`,
-                        color:'#ff9f1c',
-                        extras:{role:'cutPath',visualizationOnly:true,boardIndex:boardIdx,connectedPartId:partId,contourIndex,toolDiameter:millDiam,units:'millimeters'}
-                    });
-                });
                 allExportTabs.forEach((tab, tabIndex) => {
                     const tabGeometry=createMachiningTabGeometry(tab,millDiam,TAB_H,matThick);
                     if (!tabGeometry) return;
@@ -4468,14 +4435,8 @@ function generateAndDownloadGcode() {
                     machinedTabs.push({
                         geometry:tabGeometry,
                         name:`Tab_${tabName}`,
-                        color:'#c58b45',
-                        extras:{role:'tab',boardIndex:boardIdx,connectedPartId:partId,tabIndex,length:tab.hw*2,remainingHeight:Math.min(TAB_H,matThick),toolDiameter:millDiam,units:'millimeters'}
-                    });
-                    machiningTabMarkers.push({
-                        geometry:createMachiningTabMarkerGeometry(tab,millDiam),
-                        name:`TabMarker_${tabName}`,
                         color:'#ff2d95',
-                        extras:{role:'tabMarker',visualizationOnly:true,boardIndex:boardIdx,connectedPartId:partId,tabIndex,length:tab.hw*2,toolDiameter:millDiam,units:'millimeters'}
+                        extras:{role:'tab',boardIndex:boardIdx,connectedPartId:partId,tabIndex,length:tab.hw*2,remainingHeight:Math.min(TAB_H,matThick),toolDiameter:millDiam,units:'millimeters'}
                     });
                 });
             }
@@ -4518,9 +4479,7 @@ function generateAndDownloadGcode() {
             xOffset:boardXOffset,
             stock:stockGeometry ? [{geometry:stockGeometry,name:`Stock_${String(boardIdx+1).padStart(2,'0')}`,color:'#b98b5b',extras:{role:'stock',boardIndex:boardIdx,length:bLength,width:bWidth,thickness:matThick,units:'millimeters'}}] : [],
             parts:machinedParts,
-            tabs:machinedTabs,
-            cutPaths:machiningCutPaths,
-            tabMarkers:machiningTabMarkers
+            tabs:machinedTabs
         });
 
         // ダウンロード
@@ -4605,7 +4564,7 @@ function buildMachinedGlb(model) {
         prim.material=materialDefs.length;
         const baseColor=colorHexToFactor(entry.color);
         const materialDef={name:`${entry.name}_Material`,pbrMetallicRoughness:{baseColorFactor:baseColor,metallicFactor:0,roughnessFactor:.82},doubleSided:true};
-        if(entry.extras?.visualizationOnly)materialDef.emissiveFactor=baseColor.slice(0,3).map(v=>Math.min(1,v*.45));
+        if(entry.extras?.role==='tab')materialDef.emissiveFactor=baseColor.slice(0,3).map(v=>Math.min(1,v*.35));
         materialDefs.push(materialDef);
         const meshIndex=meshDefs.length;
         meshDefs.push({name:entry.name,primitives:[prim]});
@@ -4616,7 +4575,7 @@ function buildMachinedGlb(model) {
     const boardNodeIndices=[];
     (model.boards || []).forEach(board => {
         const roleGroups=[];
-        [['Stock',board.stock],['Parts',board.parts],['Tabs',board.tabs],['CutPaths',board.cutPaths],['TabMarkers',board.tabMarkers]].forEach(([name,entries]) => {
+        [['Stock',board.stock],['Parts',board.parts],['Tabs',board.tabs]].forEach(([name,entries]) => {
             const children=(entries || []).map(addMeshNode).filter(i=>i>=0);
             const group={name,extras:{role:name.toLowerCase(),boardIndex:board.boardIndex}};
             if(children.length)group.children=children;
@@ -4650,6 +4609,8 @@ window.kidorinExportMachinedGLB=function(){
         alert('配置・板寸法・工具径またはタブ設定がGコード生成後に変更されています。Gコードを再生成してから加工後GLBを出力してください。');
         return;
     }
+    const physicalTabCount=model.boards.reduce((sum,board)=>sum+(board.tabs?.length || 0),0);
+    if(physicalTabCount===0 && !confirm('この加工後モデルにはタブが1個もありません。\n「タブ自動配置」または「タブ設定」を行い、Gコードを再生成すると物理タブが出力されます。\nタブなしで出力を続けますか？'))return;
     try{
         const blob=new Blob([buildMachinedGlb(model)],{type:'model/gltf-binary'});
         const a=document.createElement('a');
