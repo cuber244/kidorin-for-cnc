@@ -434,6 +434,7 @@ function syncJointViewer() {
   #stl-export-btn{right:240px;background:rgba(40,167,69,0.5);border-color:rgba(40,167,69,0.3);}
   #glb-export-btn{right:350px;background:rgba(111,66,193,0.5);border-color:rgba(111,66,193,0.3);}
   #machined-glb-export-btn{right:460px;background:rgba(0,123,167,.62);border-color:rgba(90,205,235,.45);}
+  #machined-glb-export-btn:disabled{cursor:wait;opacity:.8;background:rgba(230,126,34,.72);}
   #joint-edit-btn{right:14px;top:44px;background:rgba(40,167,69,.62);border-color:rgba(100,220,130,.45);min-width:116px;}
   #joint-edit-btn.active{background:rgba(220,53,69,.72);border-color:rgba(255,120,130,.6);}
   #view-mode-btn{right:14px;top:78px;background:rgba(0,123,255,.55);border-color:rgba(80,170,255,.45);min-width:116px;display:none;}
@@ -479,12 +480,41 @@ function syncJointViewer() {
 const COLORS = ${JSON.stringify(colors)};
 let parentGeosData = ${geometriesJson};
 let parentJointData = ${jointsJson};
+let pendingMachinedDownload=null;
+let machinedButtonResetTimer=null;
 
-function exportMachinedGLB(){
+async function exportMachinedGLB(){
+  const btn=document.getElementById('machined-glb-export-btn');
   if(!window.opener || window.opener.closed || typeof window.opener.kidorinExportMachinedGLB!=='function'){
     alert('親画面で加工後GLBを生成できません。');return;
   }
-  window.opener.kidorinExportMachinedGLB();
+  if(pendingMachinedDownload){
+    const saved=window.opener.kidorinRetryMachinedGLBDownload?.(pendingMachinedDownload);
+    if(saved){
+      btn.textContent='保存を再実行しました';
+      clearTimeout(machinedButtonResetTimer);
+      machinedButtonResetTimer=setTimeout(()=>{pendingMachinedDownload=null;btn.textContent='加工後GLB';},2500);
+    }
+    return;
+  }
+  btn.disabled=true;btn.textContent='加工後GLB 処理中…';
+  // ボタンの状態を先に描画してから、親画面側の重いバイナリ生成を開始する。
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  try{
+    const result=await window.opener.kidorinExportMachinedGLB();
+    if(result?.ok){
+      pendingMachinedDownload=result.downloadId;
+      btn.textContent='完了 ('+result.sizeMB+' MB)・未保存なら再クリック';
+      btn.disabled=false;
+      clearTimeout(machinedButtonResetTimer);
+      machinedButtonResetTimer=setTimeout(()=>{pendingMachinedDownload=null;btn.textContent='加工後GLB';},60000);
+    }else{
+      btn.textContent='加工後GLB';btn.disabled=false;
+    }
+  }catch(e){
+    console.error(e);alert('加工後GLBの生成に失敗しました: '+(e.message || e));
+    btn.textContent='加工後GLB';btn.disabled=false;
+  }
 }
 
 const canvas = document.getElementById('c');
@@ -4630,25 +4660,52 @@ function buildMachinedGlb(model) {
     return glb;
 }
 
-window.kidorinExportMachinedGLB=function(){
+window.kidorinExportMachinedGLB=async function(){
     const model=window.__lastCncModel;
     if(!model || !model.boards || model.boards.length===0){
         alert('先に「CNC Gコードを生成」を実行してください。そこで指定した材料厚・工具径・タブ設定を加工後モデルに使用します。');
-        return;
+        return {ok:false};
     }
     if(model.layoutSignature!==getMachiningLayoutSignature()){
         alert('配置・板寸法・工具径またはタブ設定がGコード生成後に変更されています。Gコードを再生成してから加工後GLBを出力してください。');
-        return;
+        return {ok:false};
     }
     const physicalTabCount=model.boards.reduce((sum,board)=>sum+(board.tabs?.length || 0),0);
-    if(physicalTabCount===0 && !confirm('この加工後モデルにはタブが1個もありません。\n「タブ自動配置」または「タブ設定」を行い、Gコードを再生成すると物理タブが出力されます。\nタブなしで出力を続けますか？'))return;
+    if(physicalTabCount===0 && !confirm('この加工後モデルにはタブが1個もありません。\n「タブ自動配置」または「タブ設定」を行い、Gコードを再生成すると物理タブが出力されます。\nタブなしで出力を続けますか？'))return {ok:false};
     try{
         const blob=new Blob([buildMachinedGlb(model)],{type:'model/gltf-binary'});
         const a=document.createElement('a');
-        a.href=URL.createObjectURL(blob);
+        if(window.__machinedGlbDownload?.objectUrl)URL.revokeObjectURL(window.__machinedGlbDownload.objectUrl);
+        const objectUrl=URL.createObjectURL(blob);
+        const downloadId=`machined-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        a.href=objectUrl;
         const base=(currentStlFileName || 'kidorin').replace(/\.stl$/i,'').replace(/[^\w\u3000-\u9fff-]+/g,'_');
-        a.download=`${base}_加工後.glb`;a.click();URL.revokeObjectURL(a.href);
-    }catch(e){console.error(e);alert(`加工後GLBの生成に失敗しました: ${e.message || e}`);}
+        a.download=`${base}_加工後.glb`;
+        a.style.display='none';document.body.appendChild(a);a.click();a.remove();
+        window.__machinedGlbDownload={downloadId,objectUrl,fileName:a.download};
+        // 自動保存がブロックされた場合の再クリック用に、URLを1分間保持する。
+        setTimeout(()=>{
+            if(window.__machinedGlbDownload?.downloadId===downloadId){
+                URL.revokeObjectURL(objectUrl);window.__machinedGlbDownload=null;
+            }
+        },60000);
+        return {ok:true,downloadId,fileName:a.download,sizeMB:(blob.size/1024/1024).toFixed(1)};
+    }catch(e){
+        window.__lastMachinedExportError=String(e?.stack || e);
+        console.error(e);alert(`加工後GLBの生成に失敗しました: ${e.message || e}`);
+        return {ok:false,error:String(e?.message || e)};
+    }
+};
+
+window.kidorinRetryMachinedGLBDownload=function(downloadId){
+    const pending=window.__machinedGlbDownload;
+    if(!pending || pending.downloadId!==downloadId){
+        alert('保存データの有効期限が切れました。もう一度「加工後GLB」を押して生成してください。');
+        return false;
+    }
+    const a=document.createElement('a');a.href=pending.objectUrl;a.download=pending.fileName;
+    a.style.display='none';document.body.appendChild(a);a.click();a.remove();
+    return true;
 };
 
 // ================================================================
