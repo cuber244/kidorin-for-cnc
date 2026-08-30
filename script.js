@@ -4536,6 +4536,35 @@ function colorHexToFactor(hex) {
     return [((n>>16)&255)/255,((n>>8)&255)/255,(n&255)/255,1];
 }
 
+const MACHINING_UV_MM_PER_TILE=1000;
+
+function buildMachiningBoardUVArray(geometry) {
+    const pos=geometry?.getAttribute?.('position');
+    if(!pos || !pos.count)return null;
+    if(!geometry.getAttribute('normal'))geometry.computeVertexNormals();
+    const normal=geometry.getAttribute('normal');
+    if(!normal || normal.count!==pos.count)throw new Error('UV生成に必要な法線と頂点の数が一致しません。');
+    const uv=new Float32Array(pos.count*2),scale=MACHINING_UV_MM_PER_TILE;
+    for(let i=0;i<pos.count;i++){
+        const x=pos.getX(i),y=pos.getY(i),z=pos.getZ(i);
+        const ax=Math.abs(normal.getX(i)),ay=Math.abs(normal.getY(i)),az=Math.abs(normal.getZ(i));
+        let u,v;
+        if(ay>=ax && ay>=az){
+            // 天面・底面: 板の長手Xを木目方向(U)、板幅ZをVにする。
+            u=x/scale;v=z/scale;
+        }else if(az>=ax){
+            // 長辺と斜め側面: 木目は天面と同じX方向、Vは板厚方向。
+            u=x/scale;v=(-y)/scale;
+        }else{
+            // 木口面: 板幅Zと板厚方向で展開し、UVの潰れを防ぐ。
+            u=z/scale;v=(-y)/scale;
+        }
+        if(!Number.isFinite(u) || !Number.isFinite(v))throw new Error(`不正なUV座標を検出しました: vertex ${i}`);
+        uv[i*2]=u;uv[i*2+1]=v;
+    }
+    return uv;
+}
+
 function buildMachinedGlb(model) {
     const accessors=[],bufferViews=[],meshDefs=[],materialDefs=[],nodes=[],binParts=[];
     let byteOffset=0;
@@ -4574,6 +4603,9 @@ function buildMachinedGlb(model) {
             for(let i=0;i<norm.count;i++)arr.set([norm.getX(i),norm.getY(i),norm.getZ(i)],i*3);
             attributes.NORMAL=addAccessor(arr,'VEC3',norm.count,34962);
         }
+        const uvArr=buildMachiningBoardUVArray(geo);
+        if(!uvArr || uvArr.length!==pos.count*2)throw new Error(`UV生成に失敗しました: ${entry.name}`);
+        attributes.TEXCOORD_0=addAccessor(uvArr,'VEC2',pos.count,34962);
         const prim={attributes};
         if(geo.index){
             const use32=pos.count>65535||geo.index.count>65535;
@@ -4604,7 +4636,7 @@ function buildMachinedGlb(model) {
         nodes.push({name:board.name,children:roleGroups,translation:[board.xOffset || 0,0,0],extras:{role:'board',boardIndex:board.boardIndex,units:'millimeters'}});
         boardNodeIndices.push(nodes.length-1);
     });
-    nodes.push({name:'CNC_Result',children:boardNodeIndices,scale:[.001,.001,.001],extras:{units:'millimeters',sourceFile:model.sourceFile || '',toolDiameter:model.toolDiameter,materialThickness:model.materialThickness}});
+    nodes.push({name:'CNC_Result',children:boardNodeIndices,scale:[.001,.001,.001],extras:{units:'millimeters',sourceFile:model.sourceFile || '',toolDiameter:model.toolDiameter,materialThickness:model.materialThickness,uvMapping:'board-physical-planar',grainAxis:'board-positive-x',uvMillimetersPerTile:MACHINING_UV_MM_PER_TILE}});
     const rootIndex=nodes.length-1;
     const gltf={asset:{version:'2.0',generator:'Kidorin for CNC'},scene:0,scenes:[{name:'CNC_Result',nodes:[rootIndex]}],nodes,meshes:meshDefs,materials:materialDefs,accessors,bufferViews,buffers:[{byteLength:byteOffset}]};
     let jsonBytes=new TextEncoder().encode(JSON.stringify(gltf));
