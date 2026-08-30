@@ -4156,11 +4156,14 @@ function createMachiningExtrusionFromLoops(loops, depth) {
 function machiningRemoveDegenerateTriangles(geometry) {
     const geo=geometry.index ? geometry.toNonIndexed() : geometry;
     const pos=geo.getAttribute('position'),kept=[];
+    // Earcut/ExtrudeGeometryは複雑な輪郭で、長いが面積はほぼ0の三角形を作ることがある。
+    // それを残すとFloat32 UVが潰れ、Resoniteの接線計算で黒い三角形になる。
+    const minDoubleAreaMm2=1e-3;
     for(let i=0;i+2<pos.count;i+=3){
         const a=[pos.getX(i),pos.getY(i),pos.getZ(i)],b=[pos.getX(i+1),pos.getY(i+1),pos.getZ(i+1)],c=[pos.getX(i+2),pos.getY(i+2),pos.getZ(i+2)];
         const ab=[b[0]-a[0],b[1]-a[1],b[2]-a[2]],ac=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
         const cross=[ab[1]*ac[2]-ab[2]*ac[1],ab[2]*ac[0]-ab[0]*ac[2],ab[0]*ac[1]-ab[1]*ac[0]];
-        if(Math.hypot(cross[0],cross[1],cross[2])<=1e-8)continue;
+        if(Math.hypot(cross[0],cross[1],cross[2])<=minDoubleAreaMm2)continue;
         kept.push(...a,...b,...c);
     }
     if(kept.length===pos.count*3){geo.computeVertexNormals();return geo;}
@@ -4541,26 +4544,32 @@ const MACHINING_UV_MM_PER_TILE=1000;
 function buildMachiningBoardUVArray(geometry) {
     const pos=geometry?.getAttribute?.('position');
     if(!pos || !pos.count)return null;
-    if(!geometry.getAttribute('normal'))geometry.computeVertexNormals();
-    const normal=geometry.getAttribute('normal');
-    if(!normal || normal.count!==pos.count)throw new Error('UV生成に必要な法線と頂点の数が一致しません。');
+    if(geometry.index || pos.count%3!==0)throw new Error('UV生成には三角形ごとに頂点分離されたメッシュが必要です。');
     const uv=new Float32Array(pos.count*2),scale=MACHINING_UV_MM_PER_TILE;
-    for(let i=0;i<pos.count;i++){
-        const x=pos.getX(i),y=pos.getY(i),z=pos.getZ(i);
-        const ax=Math.abs(normal.getX(i)),ay=Math.abs(normal.getY(i)),az=Math.abs(normal.getZ(i));
-        let u,v;
-        if(ay>=ax && ay>=az){
+    for(let i=0;i<pos.count;i+=3){
+        const ax0=pos.getX(i),ay0=pos.getY(i),az0=pos.getZ(i);
+        const bx=pos.getX(i+1)-ax0,by=pos.getY(i+1)-ay0,bz=pos.getZ(i+1)-az0;
+        const cx=pos.getX(i+2)-ax0,cy=pos.getY(i+2)-ay0,cz=pos.getZ(i+2)-az0;
+        const nx=by*cz-bz*cy,ny=bz*cx-bx*cz,nz=bx*cy-by*cx;
+        const anx=Math.abs(nx),any=Math.abs(ny),anz=Math.abs(nz);
+        let projection;
+        if(any>=anx && any>=anz){
             // 天面・底面: 板の長手Xを木目方向(U)、板幅ZをVにする。
-            u=x/scale;v=z/scale;
-        }else if(az>=ax){
+            projection='board';
+        }else if(anz>=anx){
             // 長辺と斜め側面: 木目は天面と同じX方向、Vは板厚方向。
-            u=x/scale;v=(-y)/scale;
+            projection='long-side';
         }else{
             // 木口面: 板幅Zと板厚方向で展開し、UVの潰れを防ぐ。
-            u=z/scale;v=(-y)/scale;
+            projection='end-grain';
         }
-        if(!Number.isFinite(u) || !Number.isFinite(v))throw new Error(`不正なUV座標を検出しました: vertex ${i}`);
-        uv[i*2]=u;uv[i*2+1]=v;
+        for(let j=i;j<i+3;j++){
+            const x=pos.getX(j),y=pos.getY(j),z=pos.getZ(j);
+            const u=(projection==='end-grain'?z:x)/scale;
+            const v=(projection==='board'?z:-y)/scale;
+            if(!Number.isFinite(u) || !Number.isFinite(v))throw new Error(`不正なUV座標を検出しました: vertex ${j}`);
+            uv[j*2]=u;uv[j*2+1]=v;
+        }
     }
     return uv;
 }
@@ -4586,7 +4595,8 @@ function buildMachinedGlb(model) {
         accessors.push(a);return accessors.length-1;
     };
     const addMeshNode=entry => {
-        const geo=entry.geometry;
+        // 面ごとに異なる投影を安全に持てるよう、GLB出力時は全頂点を三角形単位へ分離する。
+        const geo=entry.geometry?.index ? entry.geometry.toNonIndexed() : entry.geometry;
         const pos=geo?.getAttribute?.('position');
         if(!pos || !pos.count)return -1;
         const posArr=new Float32Array(pos.count*3),pMin=[Infinity,Infinity,Infinity],pMax=[-Infinity,-Infinity,-Infinity];
@@ -4621,6 +4631,7 @@ function buildMachinedGlb(model) {
         const meshIndex=meshDefs.length;
         meshDefs.push({name:entry.name,primitives:[prim]});
         nodes.push({name:entry.name,mesh:meshIndex,extras:entry.extras || {}});
+        if(geo!==entry.geometry)geo.dispose();
         return nodes.length-1;
     };
 
