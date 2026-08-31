@@ -4540,9 +4540,9 @@ function colorHexToFactor(hex) {
 }
 
 const MACHINING_UV_MM_PER_TILE=1000;
-// Resoniteでの加工面の向きをCAMプレビューと一致させるため、出力全体のX軸を反転する。
-// メッシュ単位で反転すると板・部品・タブ間の座標がずれるため、共通ルートで一度だけ行う。
-const MACHINING_GLB_ROOT_SCALE=[-.001,.001,.001];
+// 加工後GLBはKidorinの板座標を鏡映せず、ResoniteのY-up座標へ写す。
+// CAM +X/+Y/+Z はそれぞれ glTF +X/+Z/+Y。板原点は左下天面のまま維持する。
+const MACHINING_GLB_ROOT_SCALE=[.001,.001,.001];
 
 function buildMachiningBoardUVArray(geometry) {
     const pos=geometry?.getAttribute?.('position');
@@ -4647,10 +4647,11 @@ function buildMachinedGlb(model) {
             if(children.length)group.children=children;
             nodes.push(group);roleGroups.push(nodes.length-1);
         });
-        nodes.push({name:board.name,children:roleGroups,translation:[board.xOffset || 0,0,0],extras:{role:'board',boardIndex:board.boardIndex,units:'millimeters'}});
+        nodes.push({name:board.name,children:roleGroups,translation:[board.xOffset || 0,0,0],extras:{role:'board',boardIndex:board.boardIndex,units:'millimeters',origin:'lower-left-top',topSurfaceY:0,bottomSurfaceY:-model.materialThickness}});
         boardNodeIndices.push(nodes.length-1);
     });
-    nodes.push({name:'CNC_Result',children:boardNodeIndices,scale:MACHINING_GLB_ROOT_SCALE.slice(),extras:{units:'millimeters',sourceFile:model.sourceFile || '',toolDiameter:model.toolDiameter,materialThickness:model.materialThickness,coordinateMapping:'CAM X -> glTF -X, CAM Y -> glTF Z, CAM Z -> glTF Y',xMirroredForResonite:true,topSurfaceY:0,bottomSurfaceY:-model.materialThickness,uvMapping:'board-physical-planar',grainAxis:'board-positive-x',uvMillimetersPerTile:MACHINING_UV_MM_PER_TILE}});
+    const firstBoardName=(model.boards || [])[0]?.name || '';
+    nodes.push({name:'CNC_Result',children:boardNodeIndices,scale:MACHINING_GLB_ROOT_SCALE.slice(),extras:{units:'millimeters',sourceFile:model.sourceFile || '',toolDiameter:model.toolDiameter,materialThickness:model.materialThickness,coordinateMapping:'CAM X -> glTF X, CAM Y -> glTF Z, CAM Z -> glTF Y',workOriginNode:firstBoardName,topSurfaceY:0,bottomSurfaceY:-model.materialThickness,uvMapping:'board-physical-planar',grainAxis:'board-positive-x',uvMillimetersPerTile:MACHINING_UV_MM_PER_TILE}});
     const rootIndex=nodes.length-1;
     const gltf={asset:{version:'2.0',generator:'Kidorin for CNC'},scene:0,scenes:[{name:'CNC_Result',nodes:[rootIndex]}],nodes,meshes:meshDefs,materials:materialDefs,accessors,bufferViews,buffers:[{byteLength:byteOffset}]};
     let jsonBytes=new TextEncoder().encode(JSON.stringify(gltf));
