@@ -46,8 +46,9 @@ Tab metadata should additionally identify the connected part and expose its dime
 
 - Source/CAM coordinates are millimeters.
 - The board origin is its lower-left top corner.
-- glTF is Y-up: board X maps to glTF X, board Y maps to glTF Z, and cutting depth maps to negative glTF Y.
-- Put `scale: [0.001, 0.001, 0.001]` on the root node so imported geometry is in meters while metadata remains in millimeters.
+- glTF is Y-up: cutting depth maps to negative glTF Y and board Y maps to glTF Z.
+- Mirror board X at the common root (`CAM X` maps to glTF `-X`) so the machined face orientation matches the CAM preview when imported into Resonite.
+- Put `scale: [-0.001, 0.001, 0.001]` on the root node so imported geometry is in meters, the Resonite orientation correction is applied once, and metadata remains in millimeters.
 - Do not bake the 3D viewer's centering transform into exported machining coordinates.
 
 ## Existing code to reuse
